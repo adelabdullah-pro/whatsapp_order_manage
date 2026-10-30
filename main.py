@@ -11,6 +11,7 @@ from fastapi import (
     Header,
     Depends,
     Request,
+    Response,
 )
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
