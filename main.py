@@ -40,7 +40,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==================== إعدادات WhatsApp API ====================
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "my_secure_verify_token_123")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
