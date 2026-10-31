@@ -452,8 +452,6 @@ async def verify_whatsapp_webhook(request: Request):
             return Response(content=challenge, media_type="text/plain")
         raise HTTPException(status_code=403, detail="Verification token mismatch")
     raise HTTPException(status_code=400, detail="Invalid request")
-
-
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
     try:
@@ -465,49 +463,66 @@ async def receive_whatsapp_message(request: Request):
             changes = ent.get("changes", [])
             for change in changes:
                 value = change.get("value", {})
-                messages = value.get("messages", [])
+                
+                # التحقق مما إذا كانت الحمولة تحتوي على رسائل واردة
+                messages = value.get("messages")
+                if not messages:
+                    print("تنبيه: الحدث الوارد لا يحتوي على رسائل (قد يكون تحديث حالة Delivery/Read).")
+                    continue
 
-                if messages:
-                    msg = messages[0]
-                    sender_phone = msg.get("from")
-                    msg_type = msg.get("type")
+                msg = messages[0]
+                sender_phone = msg.get("from")
+                msg_type = msg.get("type")
 
-                    # الحالة الأولى: العميل أرسل صورة (حتى لو بدون caption)
-                    if msg_type == "image":
-                        image_data = msg.get("image", {})
-                        caption = image_data.get("caption", "").strip() if image_data.get("caption") else ""
-                        media_id = image_data.get("id")
+                if not sender_phone:
+                    continue
 
-                        print(f"استلام صورة من {sender_phone}. النص المرفق: '{caption}' (Media ID: {media_id})")
+                print(f"📥 رسالة واردة من: {sender_phone}، النوع: {msg_type}")
 
-                        reply_text = (
-                            f"تم استلام صورة المنتج بنجاح! 📸\n"
-                            f"جاري معالجة طلبك والتحقق من التوفر."
-                        )
-                        if caption:
-                            reply_text += f"\nالتفاصيل المطلوبة: {caption}"
+                # الحالة الأولى: العميل أرسل صورة
+                if msg_type == "image":
+                    image_data = msg.get("image", {})
+                    caption = image_data.get("caption", "").strip() if image_data.get("caption") else ""
+                    media_id = image_data.get("id")
 
-                        await send_whatsapp_message(sender_phone, reply_text)
+                    print(f"📸 استلام صورة. التعليق: '{caption}' (Media ID: {media_id})")
 
-                    # الحالة الثانية: العميل أرسل نصاً فقط
-                    elif msg_type == "text":
-                        text_body = msg.get("text", {}).get("body", "")
-                        print(f"استلام نص فقط من {sender_phone}: {text_body}")
+                    reply_text = (
+                        f"تم استلام صورة المنتج بنجاح! 📸\n"
+                        f"جاري معالجة طلبك والتحقق من التوفر."
+                    )
+                    if caption:
+                        reply_text += f"\nالتفاصيل المطلوبة: {caption}"
 
-                        error_reply = (
-                            "مرحباً بك في محلات فالنسيا! 🌸\n\n"
-                            "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوب "
-                            "على أن تكون إحدى منتجاتنا وتحتوي على الباركود الخاص بنا. "
-                            "يمكنك كتابة المقاس أو اللون المطلوب كتعليق مرفق مع الصورة."
-                        )
-                        await send_whatsapp_message(sender_phone, error_reply)
+                    await send_whatsapp_message(sender_phone, reply_text)
+
+                # الحالة الثانية: العميل أرسل نصاً
+                elif msg_type == "text":
+                    text_body = msg.get("text", {}).get("body", "")
+                    print(f"💬 استلام نص: {text_body}")
+
+                    error_reply = (
+                        "مرحباً بك في محلات فالنسيا! 🌸\n\n"
+                        "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوب "
+                        "على أن تكون إحدى منتجاتنا وتحتوي على الباركود الخاص بنا. "
+                        "يمكنك كتابة المقاس أو اللون المطلوب كتعليق مرفق مع الصورة."
+                    )
+                    await send_whatsapp_message(sender_phone, error_reply)
+
+                # الحالة الثالثة: أي نوع آخر (ملصق، صوت، فيديو...) لضمان الرد وعدم الصمت
+                else:
+                    print(f"⚠️ استلام نوع رسالة غير مدعوم مباشرة: {msg_type}")
+                    fallback_reply = (
+                        "مرحباً بك في محلات فالنسيا! 🌸\n"
+                        "الرجاء إرسال صورة واضحة للمنتج تحتوي على الباركود لاستكمال الطلب."
+                    )
+                    await send_whatsapp_message(sender_phone, fallback_reply)
 
         return {"status": "EVENT_RECEIVED"}
 
     except Exception as e:
-        print("CRITICAL WEBHOOK ERROR:", repr(e))
+        print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
-
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
