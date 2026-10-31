@@ -45,6 +45,12 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 
+# ==================== نماذج البيانات ====================
+class LoginSchema(BaseModel):
+    email: EmailStr
+    password: str
+
+
 # ==================== مسارات المصادقة ====================
 
 @app.post("/api/login")
@@ -485,7 +491,6 @@ async def receive_whatsapp_message(request: Request):
 
                         print(f"استلام صورة من {sender_phone}. النص المرفق: '{caption}' (Media ID: {media_id})")
 
-                        # هنا سيتم لاحقاً إضافة فحص الباركود ومطابقة الصورة/المخزون
                         reply_text = (
                             f"تم استلام صورة المنتج بنجاح! 📸\n"
                             f"جاري معالجة طلبك والتحقق من التوفر."
@@ -500,7 +505,6 @@ async def receive_whatsapp_message(request: Request):
                         text_body = msg.get("text", {}).get("body", "")
                         print(f"استلام نص فقط من {sender_phone}: {text_body}")
 
-                        # الرد الإلزامي: اشتراط إرسال صورة منتج تحتوي على باركود فالنسيا
                         error_reply = (
                             "مرحباً بك في محلات فالنسيا! 🌸\n\n"
                             "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوبة "
