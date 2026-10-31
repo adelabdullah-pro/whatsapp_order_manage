@@ -445,12 +445,10 @@ async def send_whatsapp_message(to_phone: str, text: str):
 
 
 # ==================== WhatsApp Webhook Routes ====================
+# ==================== WhatsApp Webhook Routes ====================
 
 @app.get("/webhook")
 async def verify_whatsapp_webhook(request: Request):
-    """
-    مسار التحقق المطلوب من منصة Meta لربط الـ Webhook
-    """
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
@@ -464,9 +462,6 @@ async def verify_whatsapp_webhook(request: Request):
 
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
-    """
-    مسار استقبال ومعالجة رسائل واتساب الواردة
-    """
     try:
         body = await request.json()
         print("Received WhatsApp Webhook event:", json.dumps(body, indent=2))
@@ -483,10 +478,10 @@ async def receive_whatsapp_message(request: Request):
                     sender_phone = msg.get("from")
                     msg_type = msg.get("type")
 
-                    # الحالة الأولى: العميل أرسل صورة
+                    # الحالة الأولى: العميل أرسل صورة (حتى لو بدون caption)
                     if msg_type == "image":
                         image_data = msg.get("image", {})
-                        caption = image_data.get("caption", "").strip()
+                        caption = image_data.get("caption", "").strip() if image_data.get("caption") else ""
                         media_id = image_data.get("id")
 
                         print(f"استلام صورة من {sender_phone}. النص المرفق: '{caption}' (Media ID: {media_id})")
@@ -500,14 +495,14 @@ async def receive_whatsapp_message(request: Request):
 
                         await send_whatsapp_message(sender_phone, reply_text)
 
-                    # الحالة الثانية: العميل أرسل نصاً فقط (وليس صورة)
+                    # الحالة الثانية: العميل أرسل نصاً فقط
                     elif msg_type == "text":
                         text_body = msg.get("text", {}).get("body", "")
                         print(f"استلام نص فقط من {sender_phone}: {text_body}")
 
                         error_reply = (
                             "مرحباً بك في محلات فالنسيا! 🌸\n\n"
-                            "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوبة "
+                            "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوب "
                             "على أن تكون إحدى منتجاتنا وتحتوي على الباركود الخاص بنا. "
                             "يمكنك كتابة المقاس أو اللون المطلوب كتعليق مرفق مع الصورة."
                         )
@@ -516,9 +511,8 @@ async def receive_whatsapp_message(request: Request):
         return {"status": "EVENT_RECEIVED"}
 
     except Exception as e:
-        print("Error processing webhook:", repr(e))
-        return {"status": "error"}
-
+        print("CRITICAL WEBHOOK ERROR:", repr(e))
+        return {"status": "error", "details": str(e)}
 
 # ==================== تشغيل الخادم ====================
 
