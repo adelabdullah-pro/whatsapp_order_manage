@@ -45,13 +45,6 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 
-# ==================== نماذج البيانات ====================
-
-class LoginSchema(BaseModel):
-    email: EmailStr
-    password: str
-
-
 # ==================== مسارات المصادقة ====================
 
 @app.post("/api/login")
