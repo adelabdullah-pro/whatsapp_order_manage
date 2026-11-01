@@ -19,7 +19,6 @@ import qrcode
 from PIL import Image
 import httpx
 import cv2
-from pyzbar.pyzbar import decode
 
 load_dotenv()
 
