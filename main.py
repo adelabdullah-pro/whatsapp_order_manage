@@ -489,16 +489,13 @@ async def receive_whatsapp_message(request: Request):
 
                     print(f"📸 استلام صورة. التعليق: '{caption}' (Media ID: {media_id})")
 
-                    # إشعار أولي للعميل بأننا نعالج الصورة
-                    await send_whatsapp_message(sender_phone, "🔍 جاري فحص الصورة وقراءة الباركود...")
-
-                    # 1. تحميل الصورة وقراءة الباركود منها
+                    # 1. تحميل الصورة وقراءة الباركود منها مباشرة دون رسالة إزعاج مسبقة
                     barcode_value = await download_and_decode_whatsapp_image(media_id)
 
                     if not barcode_value:
                         reply_text = (
-                            "❌ عذراً، لم نتمكن من العثور على باركود واضح داخل الصورة.\n"
-                            "الرجاء إرسال صورة تحتوي على باركود منتجات فالنسيا بوضوح."
+                            "❌ عذراً، الصورة المرسلة لا تحتوي على باركود صالح لمنتجات محلات فالنسيا.\n"
+                            "الرجاء إرسال صورة منتج تابعة لنا وتحتوي على الباركود الخاص بالمحل لاستكمال الطلب."
                         )
                         await send_whatsapp_message(sender_phone, reply_text)
                     else:
@@ -537,12 +534,10 @@ async def receive_whatsapp_message(request: Request):
                                 )
                         else:
                             reply_text = (
-                                f"❌ لم يتم العثور على منتج برقم الباركود ({barcode_value}) في نظامنا."
-                                f"\nيرجى التأكد من أن الصورة تحتوي على باركود صالح لأحد منتجاتنا."
+                                f"❌ الباركود الموجود في الصورة ({barcode_value}) غير مسجل في نظامنا."
                             )
 
-                        await send_whatsapp_message(sender_phone, reply_text)
-                # الحالة الثانية: العميل أرسل نصاً
+                        await send_whatsapp_message(sender_phone, reply_text)# الحالة الثانية: العميل أرسل نصاً
                 elif msg_type == "text":
                     text_body = msg.get("text", {}).get("body", "")
                     print(f"💬 استلام نص: {text_body}")
