@@ -569,14 +569,12 @@ async def receive_whatsapp_message(request: Request):
 # ==================== دالة تحميل وقراءة الباركود من صورة واتساب ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
-        # 1. الحصول على رابط الصورة المباشر من ميتا باستخدام Media ID
         media_url_endpoint = f"https://graph.facebook.com/v19.0/{media_id}"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
         
         async with httpx.AsyncClient() as client:
             res = await client.get(media_url_endpoint, headers=headers)
             if res.status_code != 200:
-                print("❌ فشل في جلب معلومات الوسائط من ميتا")
                 return None
             
             media_data = res.json()
@@ -584,28 +582,27 @@ async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
             if not image_download_url:
                 return None
 
-            # 2. تحميل ملف الصورة الفعلي باستخدام التوكن
             img_res = await client.get(image_download_url, headers=headers)
             if img_res.status_code != 200:
-                print("❌ فشل في تحميل محتوى الصورة")
                 return None
 
-            # 3. تحويل الـ Bytes إلى صورة عبر OpenCV وقراءة الباركود
             image_bytes = img_res.content
             nparr = np.frombuffer(image_bytes, np.uint8)
             img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            decoded_objects = decode(img_cv)
-            for obj in decoded_objects:
-                barcode_data = obj.data.decode('utf-8')
-                print(f"تم العثور على باركود: {barcode_data}")
-                return barcode_data
+            # قراءة الباركود أو الـ QR Code مباشرة عبر OpenCV
+            detector = cv2.QRCodeDetector()
+            val, _, _ = detector.detectAndDecode(img_cv)
+            
+            if val:
+                print(f"تم العثور على باركود: {val}")
+                return val
 
-            print("⚠️ لم يتم العثور على أي باركود في الصورة")
+            print("⚠️ لم يتم العثور على باركود في الصورة")
             return None
 
     except Exception as e:
-        print("❌ خطأ أثناء قراءة الباركود من الصورة:", repr(e))
+        print("❌ خطأ أثناء قراءة الباركود:", repr(e))
         return None
 # ==================== تشغيل الخادم ====================
 
