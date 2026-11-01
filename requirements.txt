@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+supabase
+pydantic
+python-dotenv
+qrcode
+pillow
+httpx
+email-validator
+opencv-python-headless==4.9.0.80
+pyzbar==0.1.9
+numpy>=1.20.0
