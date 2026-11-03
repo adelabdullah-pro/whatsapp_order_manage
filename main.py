@@ -99,6 +99,7 @@ async def register_disabled():
 
 
 # ==================== التحقق من التوكن ====================
+# ==================== التحقق من التوكن (مصحح ومحدث) ====================
 
 async def get_current_user_id(
     authorization: Optional[str] = Header(default=None)
@@ -122,27 +123,42 @@ async def get_current_user_id(
     token = parts[1].strip()
 
     try:
+        # استخدام الطريقة المباشرة والآمنة لجلب المستخدم عبر التوكن في Supabase
         user_response = supabase.auth.get_user(token)
+        
+        # طباعة تشخيصية في الـ Logs للتأكد من نجاح المصادقة ومعرفة الـ ID المستخرج
+        print("🔍 Auth Response Object:", user_response)
 
-        if not user_response or not user_response.user:
+        # التعامل مع اختلاف هياكل الاستجابة في مكتبة supabase-py
+        user_obj = getattr(user_response, 'user', None) or (user_response.get('user') if isinstance(user_response, dict) else None)
+
+        if not user_obj:
             raise HTTPException(
                 status_code=401,
-                detail="لم يرجع Supabase مستخدمًا صالحًا"
+                detail="لم يرجع Supabase مستخدمًا صالحًا للتوكن"
             )
 
-        return str(user_response.user.id)
+        user_id = getattr(user_obj, 'id', None) or (user_obj.get('id') if isinstance(user_obj, dict) else None)
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="تعذر استخلاص معرف المستخدم من التوكن"
+            )
+
+        return str(user_id)
 
     except HTTPException:
         raise
 
     except Exception as e:
-        print("AUTH VERIFICATION ERROR:", repr(e))
-
+        print("🔥 AUTH VERIFICATION ERROR:", repr(e))
         raise HTTPException(
             status_code=401,
-            detail=f"فشل التحقق من التوكن: {type(e).__name__}"
+            detail=f"فشل التحقق من التوكن: {str(e)}"
         )
 
+    
 
 @app.get("/api/auth/me")
 async def auth_me(
@@ -613,7 +629,6 @@ class OrderStatusUpdate(BaseModel):
     notes: Optional[str] = None
 
 # 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
-# 1. تحديث مسار جلب قائمة الطلبات ليتوافق مع هيكل التطبيق
 @app.get("/api/orders")
 async def get_orders(
     status: Optional[str] = None, 
@@ -622,6 +637,8 @@ async def get_orders(
     user_id: str = Depends(get_current_user_id)
 ):
     try:
+        print(📦 جلب الطلبات للمستخدم برقم ID: {user_id})
+        
         query = (
             supabase.table("orders")
             .select("*, order_items(*)")
@@ -636,6 +653,8 @@ async def get_orders(
         response = query.execute()
         orders = response.data or []
         
+        print(✅ عدد الطلبات التي تم العثور عليها في قاعدة البيانات: {len(orders)})
+        
         if search:
             search_lower = search.lower()
             orders = [
@@ -645,13 +664,13 @@ async def get_orders(
                 or search_lower in o.get("customer_phone", "")
             ]
             
-        # 💡 إرجاع البيانات بمفتاح "data" أو مباشرة حسب ما يقرؤه تطبيق القائمة
         return {"status": "success", "count": len(orders), "data": orders}
         
     except Exception as e:
         print("❌ Error fetching orders:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+    
 
 # 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
 @app.get("/api/orders/{order_id}")
