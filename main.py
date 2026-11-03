@@ -636,15 +636,15 @@ async def get_orders(
     limit: int = 50,
     user_id: str = Depends(get_current_user_id)
 ):
-    # تهيئة المتغير مسبقاً لمنع أي خطأ UnboundLocalError
     orders = []
     
     try:
         print(f"📦 جلب الطلبات للمستخدم برقم ID: {user_id}")
         
+        # جلب الطلبات الأساسية أولاً بدون الـ Join لمعرفة هل ستظهر أم لا
         query = (
             supabase.table("orders")
-            .select("*, order_items(*)")
+            .select("*")
             .eq("owner_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
@@ -658,21 +658,14 @@ async def get_orders(
         
         print(f"✅ عدد الطلبات التي تم العثور عليها في قاعدة البيانات: {len(orders)}")
         
-        if search:
-            search_lower = search.lower()
-            orders = [
-                o for o in orders 
-                if search_lower in str(o.get("order_number", "")).lower() 
-                or search_lower in o.get("customer_name", "").lower() 
-                or search_lower in o.get("customer_phone", "")
-            ]
-            
         return {"status": "success", "count": len(orders), "data": orders}
         
     except Exception as e:
         print("❌ Error fetching orders:", repr(e))
-        raise HTTPException(status_code=500, detail=str(e))    
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+    
 # 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
 @app.get("/api/orders/{order_id}")
 async def get_order_details(
