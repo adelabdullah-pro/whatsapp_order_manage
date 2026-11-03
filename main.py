@@ -614,18 +614,29 @@ class OrderStatusUpdate(BaseModel):
 
 # 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
 @app.get("/api/orders")
-async def get_orders(status: Optional[str] = None, search: Optional[str] = None, limit: int = 50):
+async def get_orders(
+    status: Optional[str] = None, 
+    search: Optional[str] = None, 
+    limit: int = 50,
+    user_id: str = Depends(get_current_user_id) # 👈 ربط المسار بالتاجر الحالي المصادق عليه
+):
     try:
-        query = supabase.table("orders").select("*").order("created_at", desc=True).limit(limit)
+        # 🔍 تصفية الطلبات حصرياً حسب owner_id الخاص بالتاجر الحالي
+        query = (
+            supabase.table("orders")
+            .select("*, order_items(*)") # جلب الطلبات مع منتجاتها المرتبطة إن وجدت
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
         
-        # تصفية حسب الحالة إذا وجدت
-        if status:
+        if status and status != 'all':
             query = query.eq("status", status)
             
         response = query.execute()
-        orders = response.data or []  # تأكد من إرجاع قائمة فارغة إذا لم تكن هناك طلبات
+        orders = response.data or []
         
-        # البحث البسيط برقم الطلب أو اسم العميل أو الهاتف (إذا تم تمرير نص البحث)
+        # البحث المحلي إن وجد
         if search:
             search_lower = search.lower()
             orders = [
@@ -636,35 +647,15 @@ async def get_orders(status: Optional[str] = None, search: Optional[str] = None,
             ]
             
         return {"status": "success", "count": len(orders), "data": orders}
+        
     except Exception as e:
-        print("❌ Error fetching orders:", repr(e))
-        return {"status": "success", "count": 0, "data": []}  # إرجاع قائمة فارغة بدلاً من إيقاف التطبيق بـ 500
-# 2. جلب تفاصيل طلب واحد مع المنتجات التابعة له
-@app.get("/api/orders/{order_id}")
-async def get_order_details(order_id: str):
-    try:
-        # جلب بيانات الطلب الأساسية
-        order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
-        if not order_res.data:
-            raise HTTPException(status_code=404, detail="الطلب غير موجود")
-        
-        order_data = order_res.data[0]
-        
-        # جلب المنتجات المرتبطة بالطلب من جدول order_items
-        items_res = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
-        
-        # جلب سجل الحركات الخاصة بالطلب من order_logs
-        logs_res = supabase.table("order_logs").select("*").eq("order_id", order_id).order("created_at", desc=True).execute()
-        
-        return {
-            "status": "success",
-            "order": order_data,
-            "items": items_res.data,
-            "logs": logs_res.data
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"خطأ في جلب تفاصيل الطلب: {str(e)}")
+        print("❌ Error fetching orders for owner:", repr(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"خطأ في جلب الطلبات: {str(e)}"
+        )
 
+    
 # 3. تحديث حالة الطلب وتسجيل الحركة في السجل
 @app.put("/api/orders/{order_id}/status")
 async def update_order_status(order_id: str, data: OrderStatusUpdate):
