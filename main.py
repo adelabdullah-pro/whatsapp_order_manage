@@ -613,18 +613,18 @@ class OrderStatusUpdate(BaseModel):
     notes: Optional[str] = None
 
 # 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
+# 1. تحديث مسار جلب قائمة الطلبات ليتوافق مع هيكل التطبيق
 @app.get("/api/orders")
 async def get_orders(
     status: Optional[str] = None, 
     search: Optional[str] = None, 
     limit: int = 50,
-    user_id: str = Depends(get_current_user_id) # 👈 ربط المسار بالتاجر الحالي المصادق عليه
+    user_id: str = Depends(get_current_user_id)
 ):
     try:
-        # 🔍 تصفية الطلبات حصرياً حسب owner_id الخاص بالتاجر الحالي
         query = (
             supabase.table("orders")
-            .select("*, order_items(*)") # جلب الطلبات مع منتجاتها المرتبطة إن وجدت
+            .select("*, order_items(*)")
             .eq("owner_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
@@ -636,7 +636,6 @@ async def get_orders(
         response = query.execute()
         orders = response.data or []
         
-        # البحث المحلي إن وجد
         if search:
             search_lower = search.lower()
             orders = [
@@ -646,14 +645,64 @@ async def get_orders(
                 or search_lower in o.get("customer_phone", "")
             ]
             
+        # 💡 إرجاع البيانات بمفتاح "data" أو مباشرة حسب ما يقرؤه تطبيق القائمة
         return {"status": "success", "count": len(orders), "data": orders}
         
     except Exception as e:
-        print("❌ Error fetching orders for owner:", repr(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"خطأ في جلب الطلبات: {str(e)}"
+        print("❌ Error fetching orders:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
+@app.get("/api/orders/{order_id}")
+async def get_order_details(
+    order_id: str,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        # جلب الطلب الأساسي مع التأكد أنه يتبع للتاجر الحالي
+        order_res = (
+            supabase.table("orders")
+            .select("*")
+            .eq("id", order_id)
+            .eq("owner_id", user_id)
+            .execute()
         )
+        
+        if not order_res.data:
+            raise HTTPException(status_code=404, detail="الطلب غير موجود")
+            
+        order_data = order_res.data[0]
+        
+        # جلب عناصر الطلب (order_items)
+        items_res = (
+            supabase.table("order_items")
+            .select("*")
+            .eq("order_id", order_id)
+            .execute()
+        )
+        
+        # جلب سجل الحركات (order_logs)
+        logs_res = (
+            supabase.table("order_logs")
+            .select("*")
+            .eq("order_id", order_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        
+        # 🎯 إرجاع الهيكل الذي يطابق تماماً ما يتوقعه تطبيق الفلاتر في 5.txt
+        return {
+            "order": order_data,
+            "items": items_res.data or [],
+            "logs": logs_res.data or []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error fetching order details:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
     
 # 3. تحديث حالة الطلب وتسجيل الحركة في السجل
