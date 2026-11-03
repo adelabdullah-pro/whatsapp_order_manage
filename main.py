@@ -682,9 +682,9 @@ async def get_order_details(
     user_id: str = Depends(get_current_user_id)
 ):
     try:
-        # جلب الطلب الأساسي مع التأكد أنه يتبع للتاجر الحالي
+        # استخدام supabase_admin لتجاوز RLS
         order_res = (
-            supabase.table("orders")
+            supabase_admin.table("orders")
             .select("*")
             .eq("id", order_id)
             .eq("owner_id", user_id)
@@ -696,24 +696,21 @@ async def get_order_details(
             
         order_data = order_res.data[0]
         
-        # جلب عناصر الطلب (order_items)
         items_res = (
-            supabase.table("order_items")
+            supabase_admin.table("order_items")
             .select("*")
             .eq("order_id", order_id)
             .execute()
         )
         
-        # جلب سجل الحركات (order_logs)
         logs_res = (
-            supabase.table("order_logs")
+            supabase_admin.table("order_logs")
             .select("*")
             .eq("order_id", order_id)
             .order("created_at", desc=True)
             .execute()
         )
         
-        # 🎯 إرجاع الهيكل الذي يطابق تماماً ما يتوقعه تطبيق الفلاتر في 5.txt
         return {
             "order": order_data,
             "items": items_res.data or [],
@@ -726,6 +723,7 @@ async def get_order_details(
         print("❌ Error fetching order details:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+    
     
 # 3. تحديث حالة الطلب وتسجيل الحركة في السجل
 @app.put("/api/orders/{order_id}/status")
