@@ -637,7 +637,7 @@ async def get_orders(
     user_id: str = Depends(get_current_user_id)
 ):
     try:
-        print(📦 جلب الطلبات للمستخدم برقم ID: {user_id})
+        print(f"✅ عدد الطلبات التي تم العثور عليها في قاعدة البيانات: {len(orders)}")
         
         query = (
             supabase.table("orders")
