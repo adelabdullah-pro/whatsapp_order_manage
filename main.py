@@ -663,8 +663,7 @@ async def get_orders(
     except Exception as e:
         print("❌ Error fetching orders:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
     
 # 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
 @app.get("/api/orders/{order_id}")
