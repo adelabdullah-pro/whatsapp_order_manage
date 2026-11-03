@@ -32,7 +32,9 @@ app = FastAPI(title="Auth API with Supabase")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# عميل خاص يتخطى سياسات RLS للعمليات الخلفية بأمان
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
         "يجب ضبط SUPABASE_URL و SUPABASE_KEY في ملف البيئة"
@@ -641,29 +643,37 @@ async def get_orders(
     try:
         print(f"📦 جلب الطلبات للمستخدم برقم ID: {user_id}")
         
-        # جلب الطلبات الأساسية أولاً بدون الـ Join لمعرفة هل ستظهر أم لا
-        query = (
-            supabase.table("orders")
-            .select("*")
+        # 🎯 قم بكتابة واستخدام السطر هنا بدلاً من الاستعلام القديم:
+        response = (
+            supabase_admin.table("orders")
+            .select("*, order_items(*)")
             .eq("owner_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
         )
         
         if status and status != 'all':
-            query = query.eq("status", status)
+            response = response.eq("status", status)
             
-        response = query.execute()
-        orders = response.data or []
+        query_res = response.execute()
+        orders = query_res.data or []
         
         print(f"✅ عدد الطلبات التي تم العثور عليها في قاعدة البيانات: {len(orders)}")
         
+        if search:
+            search_lower = search.lower()
+            orders = [
+                o for o in orders 
+                if search_lower in str(o.get("order_number", "")).lower() 
+                or search_lower in o.get("customer_name", "").lower() 
+                or search_lower in o.get("customer_phone", "")
+            ]
+            
         return {"status": "success", "count": len(orders), "data": orders}
         
     except Exception as e:
         print("❌ Error fetching orders:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
-    
     
 # 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
 @app.get("/api/orders/{order_id}")
