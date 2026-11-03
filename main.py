@@ -1,7 +1,8 @@
 import os
 import json
 import io
-from typing import Optional
+from typing import Optional, List
+
 
 from fastapi import (
     FastAPI,
@@ -19,6 +20,8 @@ import qrcode
 from PIL import Image
 import httpx
 import cv2
+from datetime import datetime, timezone
+import numpy as np
 
 load_dotenv()
 
@@ -452,6 +455,7 @@ async def verify_whatsapp_webhook(request: Request):
             return Response(content=challenge, media_type="text/plain")
         raise HTTPException(status_code=403, detail="Verification token mismatch")
     raise HTTPException(status_code=400, detail="Invalid request")
+
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
     try:
@@ -464,10 +468,8 @@ async def receive_whatsapp_message(request: Request):
             for change in changes:
                 value = change.get("value", {})
                 
-                # التحقق مما إذا كانت الحمولة تحتوي على رسائل واردة
                 messages = value.get("messages")
                 if not messages:
-                    print("تنبيه: الحدث الوارد لا يحتوي على رسائل (قد يكون تحديث حالة Delivery/Read).")
                     continue
 
                 msg = messages[0]
@@ -479,92 +481,89 @@ async def receive_whatsapp_message(request: Request):
 
                 print(f"📥 رسالة واردة من: {sender_phone}، النوع: {msg_type}")
 
-                # الحالة الأولى: العميل أرسل صورة
-                # الحالة الأولى: العميل أرسل صورة
-                if msg_type == "image":
-                    image_data = msg.get("image", {})
-                    caption = image_data.get("caption", "").strip() if image_data.get("caption") else ""
-                    media_id = image_data.get("id")
+                # عزل معالجة كل رسالة لضمان عدم توقف الـ Webhook عند حدوث خطأ فردي
+                try:
+                    if msg_type == "image":
+                        image_data = msg.get("image", {})
+                        media_id = image_data.get("id")
 
-                    print(f"📸 استلام صورة. التعليق: '{caption}' (Media ID: {media_id})")
+                        print(f"📸 استلام صورة. (Media ID: {media_id})")
 
-                    # 1. تحميل الصورة وقراءة الباركود منها مباشرة دون رسالة إزعاج مسبقة
-                    barcode_value = await download_and_decode_whatsapp_image(media_id)
+                        # 1. تحميل وقراءة الباركود
+                        barcode_value = await download_and_decode_whatsapp_image(media_id)
 
-                    if not barcode_value:
-                        reply_text = (
-                            "❌ عذراً، الصورة المرسلة لا تحتوي على باركود صالح لمنتجات محلات فالنسيا.\n"
-                            "الرجاء إرسال صورة منتج تابعة لنا وتحتوي على الباركود الخاص بالمحل لاستكمال الطلب."
-                        )
-                        await send_whatsapp_message(sender_phone, reply_text)
-                    else:
-                        # استخلاص رقم الموديل من قيمة الباركود (مثلاً BAR-M123 -> M123)
-                        model_number = barcode_value.replace("BAR-", "").strip()
-
-                        # 2. فحص قاعدة البيانات Supabase للتأكد من توفر المنتج
-                        db_res = (
-                            supabase.table("products")
-                            .select("*, product_variants(stock_qty)")
-                            .ilike("model_number", model_number)
-                            .execute()
-                        )
-
-                        if db_res.data and len(db_res.data) > 0:
-                            product = db_res.data[0]
-                            prod_name = product.get("name", "منتج فالنسيا")
-                            price = product.get("retail_price", 0)
-                            
-                            # التحقق من إجمالي المخزون المتاح للمنتج
-                            variants = product.get("product_variants", [])
-                            total_stock = sum(v.get("stock_qty", 0) for v in variants)
-
-                            if total_stock > 0:
-                                reply_text = (
-                                    f"✅ **المنتج متوفر لدينا!** 🌸\n\n"
-                                    f"📦 **اسم المنتج:** {prod_name}\n"
-                                    f"🏷️ **رقم الموديل:** {model_number}\n"
-                                    f"💰 **السعر:** {price} ريال\n"
-                                    f"📊 **المخزون المتاح:** {total_stock} قطعه\n\n"
-                                    f"يمكنك إتمام طلبك الآن بتحديد المقاس واللون المطلوب."
-                                )
-                            else:
-                                reply_text = (
-                                    f"⚠️ عذراً، المنتج ({prod_name}) برقم الموديل ({model_number}) **غير متوفر حالياً في المخزون**."
-                                )
-                        else:
+                        if not barcode_value:
                             reply_text = (
-                                f"❌ الباركود الموجود في الصورة ({barcode_value}) غير مسجل في نظامنا."
+                                "❌ عذراً، الصورة المرسلة لا تحتوي على باركود صالح لمنتجاتنا.\n"
+                                "الرجاء إرسال صورة منتج تحتوي على الباركود الخاص بالمحل لاستكمال الطلب."
+                            )
+                            await send_whatsapp_message(sender_phone, reply_text)
+                        else:
+                            model_number = barcode_value.replace("BAR-", "").strip()
+
+                            # 2. فحص قاعدة البيانات وجلب المنتج مع الألوان والمقاسات والمخزون بالطريقة الصحيحة
+                            db_res = (
+                                supabase.table("products")
+                                .select("*, product_colors(id, color_name, product_variants(stock_qty))")
+                                .ilike("model_number", model_number)
+                                .execute()
                             )
 
-                        await send_whatsapp_message(sender_phone, reply_text)# الحالة الثانية: العميل أرسل نصاً
-                elif msg_type == "text":
-                    text_body = msg.get("text", {}).get("body", "")
-                    print(f"💬 استلام نص: {text_body}")
+                            if db_res.data and len(db_res.data) > 0:
+                                product = db_res.data[0]
+                                prod_name = product.get("name", "منتج")
+                                price = product.get("retail_price", 0)
+                                
+                                # حساب إجمالي المخزون من تجميع المتغيرات عبر الألوان
+                                total_stock = 0
+                                for color in product.get("product_colors", []):
+                                    for variant in color.get("product_variants", []):
+                                        total_stock += variant.get("stock_qty", 0)
 
-                    error_reply = (
-                        "مرحباً بك في محلات فالنسيا! 🌸\n\n"
-                        "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوب "
-                        "على أن تكون إحدى منتجاتنا وتحتوي على الباركود الخاص بنا. "
-                        "يمكنك كتابة المقاس أو اللون المطلوب كتعليق مرفق مع الصورة."
-                    )
-                    await send_whatsapp_message(sender_phone, error_reply)
+                                if total_stock > 0:
+                                    reply_text = (
+                                        f"✅ **المنتج متوفر لدينا!** 🌸\n\n"
+                                        f"📦 **اسم المنتج:** {prod_name}\n"
+                                        f"🏷️ **رقم الموديل:** {model_number}\n"
+                                        f"💰 **السعر:** {price} ريال\n"
+                                        f"📊 **المخزون المتاح:** {total_stock} قطعة\n\n"
+                                        f"يمكنك إتمام طلبك الآن بتحديد المقاس واللون المطلوب."
+                                    )
+                                else:
+                                    reply_text = (
+                                        f"⚠️ عذراً، المنتج ({prod_name}) برقم الموديل ({model_number}) **غير متوفر حالياً في المخزون**."
+                                    )
+                            else:
+                                reply_text = (
+                                    f"❌ الباركود الموجود في الصورة ({barcode_value}) غير مسجل في نظامنا."
+                                )
 
-                # الحالة الثالثة: أي نوع آخر (ملصق، صوت، فيديو...) لضمان الرد وعدم الصمت
-                else:
-                    print(f"⚠️ استلام نوع رسالة غير مدعوم مباشرة: {msg_type}")
-                    fallback_reply = (
-                        "مرحباً بك في محلات فالنسيا! 🌸\n"
-                        "الرجاء إرسال صورة واضحة للمنتج تحتوي على الباركود لاستكمال الطلب."
-                    )
-                    await send_whatsapp_message(sender_phone, fallback_reply)
+                            await send_whatsapp_message(sender_phone, reply_text)
+
+                    elif msg_type == "text":
+                        error_reply = (
+                            "مرحباً بك! 🌸\n\n"
+                            "لبدء الطلب أو الاستفسار، يرجى إرسال صورة للمنتج المطلوب "
+                            "على أن تحتوي على الباركود الخاص بالمحل."
+                        )
+                        await send_whatsapp_message(sender_phone, error_reply)
+
+                    else:
+                        fallback_reply = (
+                            "مرحباً بك! 🌸\n"
+                            "الرجاء إرسال صورة واضحة للمنتج تحتوي على الباركود لاستكمال الطلب."
+                        )
+                        await send_whatsapp_message(sender_phone, fallback_reply)
+
+                except Exception as inner_error:
+                    # طباعة الخطأ الفردي للرسالة دون إيقاف باقي السيرفر أو طلبات الـ Webhook الأخرى
+                    print(f"❌ خطأ أثناء معالجة رسالة العميل {sender_phone}:", repr(inner_error))
 
         return {"status": "EVENT_RECEIVED"}
 
     except Exception as e:
         print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
-
-
 # ==================== دالة تحميل وقراءة الباركود من صورة واتساب ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
@@ -603,6 +602,114 @@ async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     except Exception as e:
         print("❌ خطأ أثناء قراءة الباركود:", repr(e))
         return None
+
+# ==================== ادارة الطلبات ====================
+
+# نماذج البيانات (Pydantic Models) للتحقق من المدخلات
+class OrderStatusUpdate(BaseModel):
+    new_status: str  # مثال: new, processing, shipping, completed, cancelled
+    cancellation_reason: Optional[str] = None
+    notes: Optional[str] = None
+
+# 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
+@app.get("/api/orders")
+async def get_orders(status: Optional[str] = None, search: Optional[str] = None, limit: int = 50):
+    try:
+        query = supabase.table("orders").select("*").order("created_at", desc=True).limit(limit)
+        
+        # تصفية حسب الحالة إذا وجدت
+        if status:
+            query = query.eq("status", status)
+            
+        response = query.execute()
+        orders = response.data or []  # تأكد من إرجاع قائمة فارغة إذا لم تكن هناك طلبات
+        
+        # البحث البسيط برقم الطلب أو اسم العميل أو الهاتف (إذا تم تمرير نص البحث)
+        if search:
+            search_lower = search.lower()
+            orders = [
+                o for o in orders 
+                if search_lower in str(o.get("order_number", "")).lower() 
+                or search_lower in o.get("customer_name", "").lower() 
+                or search_lower in o.get("customer_phone", "")
+            ]
+            
+        return {"status": "success", "count": len(orders), "data": orders}
+    except Exception as e:
+        print("❌ Error fetching orders:", repr(e))
+        return {"status": "success", "count": 0, "data": []}  # إرجاع قائمة فارغة بدلاً من إيقاف التطبيق بـ 500
+# 2. جلب تفاصيل طلب واحد مع المنتجات التابعة له
+@app.get("/api/orders/{order_id}")
+async def get_order_details(order_id: str):
+    try:
+        # جلب بيانات الطلب الأساسية
+        order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
+        if not order_res.data:
+            raise HTTPException(status_code=404, detail="الطلب غير موجود")
+        
+        order_data = order_res.data[0]
+        
+        # جلب المنتجات المرتبطة بالطلب من جدول order_items
+        items_res = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
+        
+        # جلب سجل الحركات الخاصة بالطلب من order_logs
+        logs_res = supabase.table("order_logs").select("*").eq("order_id", order_id).order("created_at", desc=True).execute()
+        
+        return {
+            "status": "success",
+            "order": order_data,
+            "items": items_res.data,
+            "logs": logs_res.data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في جلب تفاصيل الطلب: {str(e)}")
+
+# 3. تحديث حالة الطلب وتسجيل الحركة في السجل
+@app.put("/api/orders/{order_id}/status")
+async def update_order_status(order_id: str, data: OrderStatusUpdate):
+    try:
+        # أخذ الحالة القديمة للطلب أولاً
+        current_order = supabase.table("orders").select("status").eq("id", order_id).execute()
+        if not current_order.data:
+            raise HTTPException(status_code=404, detail="الطلب غير موجود")
+            
+        old_status = current_order.data[0]["status"]
+        new_status = data.new_status
+        
+        # تجهيز حقول التحديث وتواريخ الحالات
+        update_data = {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}        
+        if new_status == "processing":
+            update_data["confirmed_at"] = "now()"
+        elif new_status == "shipping":
+            update_data["shipped_at"] = "now()"
+        elif new_status == "completed":
+            update_data["delivered_at"] = "now()"
+        elif new_status == "cancelled":
+            update_data["cancelled_at"] = "now()"
+            if data.cancellation_reason:
+                update_data["cancellation_reason"] = data.cancellation_reason
+
+        # تنفيذ التحديث في جدول orders
+        supabase.table("orders").update(update_data).eq("id", order_id).execute()
+        
+        # تسجيل الحركة في جدول order_logs
+        supabase.table("order_logs").insert({
+            "order_id": order_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "notes": data.notes or f"تم تغيير الحالة من {old_status} إلى {new_status}"
+        }).execute()
+
+        return {
+            "status": "success",
+            "message": f"تم تحديث حالة الطلب إلى ({new_status}) بنجاح",
+            "old_status": old_status,
+            "new_status": new_status
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
+
+
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
