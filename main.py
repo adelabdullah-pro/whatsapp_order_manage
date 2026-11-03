@@ -222,7 +222,6 @@ async def get_products():
 
 
 # ==================== حفظ المنتج مع الصور والألوان ====================
-
 @app.post("/api/products/with-images")
 async def add_product_with_images(
     request: Request,
@@ -316,11 +315,15 @@ async def add_product_with_images(
             if not color_name or not str(color_name).strip():
                 continue
 
-            color_res = supabase.table("product_colors").insert({
+            # تجهيز بيانات اللون بشكل آمن لتجنب إرسال قيم null تسبب انهيار القاعدة
+            color_insert_data = {
                 "product_id": product_id,
                 "color_name": str(color_name).strip(),
-                "color_code": color_item.get("color_code")
-            }).execute()
+            }
+            if color_item.get("color_code"):
+                color_insert_data["color_code"] = color_item.get("color_code")
+
+            color_res = supabase.table("product_colors").insert(color_insert_data).execute()
 
             if color_res.data:
                 color_id = color_res.data[0]["id"]
@@ -335,9 +338,7 @@ async def add_product_with_images(
                             "stock_qty": variant.get("stock_qty", 0)
                         }).execute()
 
-                color_images = form.getlist(
-                    f"color_images_{index}"
-                )
+                color_images = form.getlist(f"color_images_{index}")
 
                 for img in color_images:
                     if hasattr(img, "filename") and img.filename:
@@ -385,13 +386,13 @@ async def add_product_with_images(
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as e:
+        # 🔍 طباعة الخطأ البرمجي الحقيقي بالكامل في لوحة تحكم Render Logs
+        print("🔥 DETAILED ADD PRODUCT ERROR:", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="حدث خطأ أثناء حفظ المنتج أو صوره"
+            detail=f"خطأ أثناء حفظ المنتج: {str(e)}"
         )
-
-
 # ==================== جلب صور المنتجات ====================
 
 @app.get("/api/product-images")
