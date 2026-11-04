@@ -1090,36 +1090,43 @@ async def get_order_details(
 
     
     
-# 3. تحديث حالة الطلب وتسجيل الحركة في السجل
+# 3. تحديث حالة الطلب وتسجيل الحركة في السجل (مصحح)
 @app.put("/api/orders/{order_id}/status")
 async def update_order_status(order_id: str, data: OrderStatusUpdate):
     try:
-        # أخذ الحالة القديمة للطلب أولاً
-        current_order = supabase.table("orders").select("status").eq("id", order_id).execute()
+        # استخدام supabase_admin لتفادي قيود RLS وضمان جلب البيانات وتحديثها بسلاسة
+        current_order = supabase_admin.table("orders").select("status").eq("id", order_id).execute()
         if not current_order.data:
             raise HTTPException(status_code=404, detail="الطلب غير موجود")
             
         old_status = current_order.data[0]["status"]
         new_status = data.new_status
         
-        # تجهيز حقول التحديث وتواريخ الحالات
-        update_data = {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}        
+        # تجهيز التوقيت الحالي بصيغة ISO الصحيحة لكي تقبلها قاعدة البيانات
+        current_time_iso = datetime.now(timezone.utc).isoformat()
+        
+        # تجهيز حقول التحديث وتواريخ الحالات بشكل صحيح
+        update_data = {
+            "status": new_status, 
+            "updated_at": current_time_iso
+        }        
+        
         if new_status == "processing":
-            update_data["confirmed_at"] = "now()"
+            update_data["confirmed_at"] = current_time_iso
         elif new_status == "shipping":
-            update_data["shipped_at"] = "now()"
+            update_data["shipped_at"] = current_time_iso
         elif new_status == "completed":
-            update_data["delivered_at"] = "now()"
+            update_data["delivered_at"] = current_time_iso
         elif new_status == "cancelled":
-            update_data["cancelled_at"] = "now()"
+            update_data["cancelled_at"] = current_time_iso
             if data.cancellation_reason:
                 update_data["cancellation_reason"] = data.cancellation_reason
 
-        # تنفيذ التحديث في جدول orders
-        supabase.table("orders").update(update_data).eq("id", order_id).execute()
+        # تنفيذ التحديث في جدول orders باستخدام supabase_admin
+        supabase_admin.table("orders").update(update_data).eq("id", order_id).execute()
         
         # تسجيل الحركة في جدول order_logs
-        supabase.table("order_logs").insert({
+        supabase_admin.table("order_logs").insert({
             "order_id": order_id,
             "old_status": old_status,
             "new_status": new_status,
@@ -1133,8 +1140,8 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
             "new_status": new_status
         }
     except Exception as e:
+        print("❌ Error updating order status:", repr(e))
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
-
 
 # ==================== تشغيل الخادم ====================
 
