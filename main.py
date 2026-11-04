@@ -20,6 +20,8 @@ import httpx
 import cv2
 from datetime import datetime, timezone
 import numpy as np
+from difflib import get_close_matches
+
 
 
 load_dotenv()
@@ -475,7 +477,8 @@ async def verify_whatsapp_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Verification token mismatch")
     raise HTTPException(status_code=400, detail="Invalid request")
 
-# ==================== دالة استقبال رسائل واتساب ====================
+
+# ==================== دالة استقبال رسائل واتساب مع الذكاء والتصحيح الإملائي ====================
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
     try:
@@ -558,44 +561,60 @@ async def receive_whatsapp_message(request: Request):
                         if existing_customer_res.data and len(existing_customer_res.data) > 0:
                             known_customer_name = existing_customer_res.data[0].get("customer_name")
 
+                        # تصفية الألوان التي تحتوي على مخزون فعلي فقط (> 0)
+                        all_colors = product.get("product_colors", [])
+                        valid_colors = []
+                        for c in all_colors:
+                            has_stock = any(v.get("stock_qty", 0) > 0 for v in c.get("product_variants", []))
+                            if has_stock:
+                                valid_colors.append(c)
+
                         session_data = {
                             "product_id": product["id"],
                             "product_name": product["name"],
                             "model_number": model_number,
                             "retail_price": product["retail_price"],
-                            "colors_data": product.get("product_colors", [])
+                            "colors_data": valid_colors
                         }
 
-                        # إذا كان العميل معروفاً مسبقاً، نحفظ اسمه ونتجاوز خطوة السؤال عنه
                         if known_customer_name:
                             session_data["customer_name"] = known_customer_name
-                            session_data["step"] = "AWAITING_COLOR"
-                            USER_SESSIONS[sender_phone] = session_data
-
-                            colors_list_str = ""
-                            for c in product.get("product_colors", []):
-                                color_has_stock = any(v.get("stock_qty", 0) > 0 for v in c.get("product_variants", []))
-                                if color_has_stock:
-                                    colors_list_str += f"- {c['color_name']}\n"
-
-                            reply_text = (
-                                f"أهلاً بك مرة أخرى يا *{known_customer_name}*! 🌸\n"
-                                f"✅ **المنتج متوفر:** {product['name']}\n"
-                                f"💰 السعر: {product['retail_price']} ريال\n\n"
-                                f"🎨 **الألوان المتوفرة:**\n{colors_list_str}\n"
-                                f"يرجى إرسال **اسم اللون** المطلوب الآن (أو اكتب 'إلغاء'):"
-                            )
                         else:
-                            # إذا كان العميل جديداً نسأله عن اسمه أولاً
-                            session_data["step"] = "AWAITING_NAME"
-                            USER_SESSIONS[sender_phone] = session_data
+                            session_data["customer_name"] = None
 
-                            reply_text = (
-                                f"أهلاً بك في محل فالنسيا! 🌸\n"
-                                f"المنتج (*{product['name']}*) متوفر لدينا بسعر {product['retail_price']} ريال.\n\n"
-                                f"لخدمتك بشكل أفضل وتجهيز طلبك، يرجى إرسال **اسمك الكريم** أولاً:"
-                            )
+                        greeting = f"أهلاً بك مرة أخرى يا *{known_customer_name}*! 🌸" if known_customer_name else f"أهلاً بك في محل فالنسيا! 🌸\nالمنتج (*{product['name']}*) متوفر لدينا بسعر {product['retail_price']} ريال.\n\nلخدمتك بشكل أفضل، يرجى إرسال **اسمك الكريم** أولاً:"
 
+                        # 🧠 الذكاء الأول: إذا لم يتبقى إلا لون واحد متاح للمنتج
+                        if len(valid_colors) == 1:
+                            single_color = valid_colors[0]
+                            session_data["pending_color"] = single_color
+                            if known_customer_name:
+                                session_data["step"] = "CONFIRM_SINGLE_COLOR"
+                                reply_text = (
+                                    f"{greeting}\n"
+                                    f"✅ المنتج: {product['name']}\n"
+                                    f"🎨 اللون المتاح الوحيد هو: *{single_color['color_name']}*.\n"
+                                    f"هل تريد هذا اللون؟ (اكتب **نعم** أو **لا**):"
+                                )
+                            else:
+                                session_data["step"] = "AWAITING_NAME"
+                                reply_text = f"{greeting}"
+                        else:
+                            if known_customer_name:
+                                session_data["step"] = "AWAITING_COLOR"
+                                colors_list_str = "".join([f"- {c['color_name']}\n" for c in valid_colors])
+                                reply_text = (
+                                    f"{greeting}\n"
+                                    f"✅ **المنتج متوفر:** {product['name']}\n"
+                                    f"💰 السعر: {product['retail_price']} ريال\n\n"
+                                    f"🎨 **الألوان المتوفرة:**\n{colors_list_str}\n"
+                                    f"يرجى إرسال **اسم اللون** المطلوب الآن:"
+                                )
+                            else:
+                                session_data["step"] = "AWAITING_NAME"
+                                reply_text = f"{greeting}"
+
+                        USER_SESSIONS[sender_phone] = session_data
                         await send_whatsapp_message(sender_phone, reply_text)
 
                 # ----------------------------------------------------
@@ -617,71 +636,144 @@ async def receive_whatsapp_message(request: Request):
                     if current_step == "AWAITING_NAME":
                         customer_name = incoming_text
                         session["customer_name"] = customer_name
-                        session["step"] = "AWAITING_COLOR"
+                        valid_colors = session.get("colors_data", [])
+
+                        if len(valid_colors) == 1:
+                            single_color = valid_colors[0]
+                            session["pending_color"] = single_color
+                            session["step"] = "CONFIRM_SINGLE_COLOR"
+                            reply_text = (
+                                f"يسعدنا تعارفنا معك يا *{customer_name}*! ✨\n"
+                                f"🎨 اللون المتاح الوحيد هو: *{single_color['color_name']}*.\n"
+                                f"هل تريد هذا اللون؟ (اكتب **نعم** أو **لا**):"
+                            )
+                        else:
+                            session["step"] = "AWAITING_COLOR"
+                            colors_list_str = "".join([f"- {c['color_name']}\n" for c in valid_colors])
+                            reply_text = (
+                                f"يسعدنا تعارفنا معك يا *{customer_name}*! ✨\n\n"
+                                f"🎨 **الألوان المتوفرة للمنتج:**\n{colors_list_str}\n"
+                                f"يرجى إرسال **اسم اللون** المطلوب الآن:"
+                            )
                         USER_SESSIONS[sender_phone] = session
-
-                        colors_data = session.get("colors_data", [])
-                        colors_list_str = ""
-                        for c in colors_data:
-                            color_has_stock = any(v.get("stock_qty", 0) > 0 for v in c.get("product_variants", []))
-                            if color_has_stock:
-                                colors_list_str += f"- {c['color_name']}\n"
-
-                        reply_text = (
-                            f"يسعدنا تعارفنا معك يا *{customer_name}*! ✨\n\n"
-                            f"🎨 **الألوان المتوفرة للمنتج:**\n{colors_list_str}\n"
-                            f"يرجى إرسال **اسم اللون** المطلوب الآن:"
-                        )
                         await send_whatsapp_message(sender_phone, reply_text)
+                        continue
 
-                    # الخطوة أ: اختيار اللون
+                    # 🧠 تأكيد اللون الوحيد (نعم / لا)
+                    elif current_step == "CONFIRM_SINGLE_COLOR":
+                        if incoming_text.lower() in ["نعم", "ايوه", "يس", "yes", "y"]:
+                            matched_color = session.get("pending_color")
+                            session["selected_color"] = matched_color["color_name"]
+                            session["selected_color_id"] = matched_color["id"]
+                            
+                            valid_variants = [v for v in matched_color.get("product_variants", []) if v.get("stock_qty", 0) > 0]
+                            if len(valid_variants) == 1:
+                                single_variant = valid_variants[0]
+                                session["pending_variant"] = single_variant
+                                session["step"] = "CONFIRM_SINGLE_SIZE"
+                                reply_text = (
+                                    f"تم اعتماد اللون: *{matched_color['color_name']}* 👍\n"
+                                    f"📏 المقاس المتاح الوحيد هو: *{single_variant['size_label']}* (المتوفر: {single_variant['stock_qty']} قطعه).\n"
+                                    f"هل تريد هذا المقاس؟ (اكتب **نعم** أو **لا**):"
+                                )
+                            else:
+                                session["step"] = "AWAITING_SIZE"
+                                sizes_str = "".join([f"- المقاس: {v['size_label']} (المتوفر: {v['stock_qty']} قطعه)\n" for v in valid_variants])
+                                reply_text = (
+                                    f"تم اعتماد اللون: *{matched_color['color_name']}* 👍\n\n"
+                                    f"📏 **المقاسات المتاحة:**\n{sizes_str}\n"
+                                    f"الرجاء إرسال **المقاس** المطلوب:"
+                                )
+                        else:
+                            USER_SESSIONS.pop(sender_phone, None)
+                            reply_text = "🔄 تم إلغاء الطلب. أرسل صورة جديدة متى شئت."
+                        
+                        USER_SESSIONS[sender_phone] = session
+                        await send_whatsapp_message(sender_phone, reply_text)
+                        continue
+
+                    # الخطوة أ: اختيار اللون مع دعم التصحيح الإملائي للأخطاء مثل "اححمر"
                     elif current_step == "AWAITING_COLOR":
                         colors_data = session.get("colors_data", [])
-                        matched_color = None
+                        valid_color_names = [c["color_name"] for c in colors_data]
                         
-                        for c in colors_data:
-                            if c["color_name"].strip().lower() == incoming_text.lower():
-                                matched_color = c
-                                break
+                        matched_name = None
+                        close_matches = get_close_matches(incoming_text.lower(), [name.lower() for name in valid_color_names], n=1, cutoff=0.5)
+                        if close_matches:
+                            matched_name = next(c for c in valid_color_names if c.lower() == close_matches[0])
+
+                        matched_color = next((c for c in colors_data if c["color_name"] == matched_name), None)
 
                         if not matched_color:
-                            await send_whatsapp_message(sender_phone, "❌ اللون الذي أدخلته غير متوفر. يرجى اختيار لون صحيح من القائمة السابقة:")
+                            await send_whatsapp_message(sender_phone, "❌ اللون الذي أدخلته غير متوفر أو غير واضح. يرجى اختيار لون صحيح من القائمة:")
                             continue
 
                         session["selected_color"] = matched_color["color_name"]
                         session["selected_color_id"] = matched_color["id"]
-                        session["step"] = "AWAITING_SIZE"
+                        
+                        valid_variants = [v for v in matched_color.get("product_variants", []) if v.get("stock_qty", 0) > 0]
+                        
+                        # 🧠 الذكاء الثاني: إذا كان لهذا اللون مقاس واحد فقط متاح
+                        if len(valid_variants) == 1:
+                            single_variant = valid_variants[0]
+                            session["pending_variant"] = single_variant
+                            session["step"] = "CONFIRM_SINGLE_SIZE"
+                            reply_text = (
+                                f"تم اختيار اللون: *{matched_color['color_name']}* 🌸\n"
+                                f"📏 المقاس المتاح الوحيد لهذا اللون هو: *{single_variant['size_label']}* (المتوفر: {single_variant['stock_qty']} قطعه).\n"
+                                f"هل تريد هذا المقاس؟ (اكتب **نعم** أو **لا**):"
+                            )
+                        else:
+                            session["step"] = "AWAITING_SIZE"
+                            sizes_str = "".join([f"- المقاس: {v['size_label']} (المتوفر: {v['stock_qty']} قطعه)\n" for v in valid_variants])
+                            reply_text = (
+                                f"تم اختيار اللون: *{matched_color['color_name']}* 🌸\n\n"
+                                f"📏 **المقاسات المتاحة:**\n{sizes_str}\n"
+                                f"الرجاء إرسال **المقاس** المطلوب:"
+                            )
+                        
                         USER_SESSIONS[sender_phone] = session
-
-                        sizes_str = ""
-                        for v in matched_color.get("product_variants", []):
-                            if v.get("stock_qty", 0) > 0:
-                                sizes_str += f"- المقاس: {v['size_label']} (المتوفر: {v['stock_qty']} قطعه)\n"
-
-                        reply_text = (
-                            f"تم اختيار اللون: *{matched_color['color_name']}* 🌸\n\n"
-                            f"📏 **المقاسات المتاحة لهذا اللون:**\n{sizes_str}\n"
-                            f"الرجاء إرسال **المقاس** المطلوب:"
-                        )
                         await send_whatsapp_message(sender_phone, reply_text)
 
-                    # الخطوة ب: اختيار المقاس والتحقق من توفر المخزون
+                    # 🧠 تأكيد المقاس الوحيد (نعم / لا)
+                    elif current_step == "CONFIRM_SINGLE_SIZE":
+                        if incoming_text.lower() in ["نعم", "ايوه", "يس", "yes", "y"]:
+                            matched_variant = session.get("pending_variant")
+                            session["selected_size"] = matched_variant["size_label"]
+                            session["max_stock"] = matched_variant["stock_qty"]
+                            session["step"] = "AWAITING_QUANTITY"
+                            
+                            reply_text = (
+                                f"تم اعتماد المقاس: *{matched_variant['size_label']}* 👍\n"
+                                f"المخزون المتاح: {matched_variant['stock_qty']} قطعة.\n"
+                                f"كم عدد القطع أو **الكمية** المطلوبة؟ (اكتب رقم الكمية):"
+                            )
+                        else:
+                            USER_SESSIONS.pop(sender_phone, None)
+                            reply_text = "🔄 تم إلغاء الطلب. أرسل صورة جديدة متى شئت."
+                        
+                        USER_SESSIONS[sender_phone] = session
+                        await send_whatsapp_message(sender_phone, reply_text)
+                        continue
+
+                    # الخطوة ب: اختيار المقاس مع دعم المطابقة الذكية للأخطاء الإملائية
                     elif current_step == "AWAITING_SIZE":
                         colors_data = session.get("colors_data", [])
                         selected_color_id = session.get("selected_color_id")
-                        
                         target_color = next((c for c in colors_data if c["id"] == selected_color_id), None)
+                        
                         matched_variant = None
-
                         if target_color:
-                            for v in target_color.get("product_variants", []):
-                                if str(v["size_label"]).strip().lower() == incoming_text.lower():
-                                    if v.get("stock_qty", 0) > 0:
-                                        matched_variant = v
-                                    break
+                            valid_variants = [v for v in target_color.get("product_variants", []) if v.get("stock_qty", 0) > 0]
+                            valid_sizes_str = [str(v["size_label"]) for v in valid_variants]
+                            
+                            close_size_matches = get_close_matches(incoming_text.lower(), [s.lower() for s in valid_sizes_str], n=1, cutoff=0.5)
+                            matched_size_label = close_size_matches[0] if close_size_matches else None
+                            
+                            matched_variant = next((v for v in valid_variants if str(v["size_label"]).lower() == matched_size_label), None)
 
                         if not matched_variant:
-                            await send_whatsapp_message(sender_phone, "❌ المقاس المدخل غير متوفر أو نفذ من المخزون لهذا اللون. يرجى إرسال مقاس صحيح من القائمة:")
+                            await send_whatsapp_message(sender_phone, "❌ المقاس المدخل غير صحيح أو نفذ من المخزون. يرجى اختيار مقاس من القائمة:")
                             continue
 
                         session["selected_size"] = matched_variant["size_label"]
@@ -689,7 +781,7 @@ async def receive_whatsapp_message(request: Request):
                         session["step"] = "AWAITING_QUANTITY"
                         USER_SESSIONS[sender_phone] = session
 
-                        reply_text = f"تم اختيار المقاس: *{matched_variant['size_label']}* 👍\nالمخزون المتاح: {matched_variant['stock_qty']} قطعه.\nكم عدد القطع أو **الكمية** المطلوبة؟ (اكتب رقم الكمية):"
+                        reply_text = f"تم اختيار المقاس: *{matched_variant['size_label']}* 👍\nالمخزون المتاح: {matched_variant['stock_qty']} قطعة.\nكم عدد القطع المطلوبة؟ (اكتب رقم الكمية):"
                         await send_whatsapp_message(sender_phone, reply_text)
 
                     # الخطوة ج: التحقق من الكمية المدخلة مقارنة بالمخزون
@@ -710,11 +802,10 @@ async def receive_whatsapp_message(request: Request):
                         session["step"] = "AWAITING_ADDRESS"
                         USER_SESSIONS[sender_phone] = session
 
-                        reply_text = "رائع! 📦\nالرجاء إرسال **عنوان الشحن الخاص بك** بالتفصيل (المدينة، الشارع، علامة مميزة) لتسجيل الطلب فوراً:"
+                        reply_text = "رائع! 📦\nالرجاء إرسال **عنوان الشحن الخاص بك** بالتفصيل لتسجيل الطلب فوراً:"
                         await send_whatsapp_message(sender_phone, reply_text)
 
-                    # الخطوة د: العنوان وحفظ الطلب الفوري في قاعدة البيانات مع اسم العميل الحقيقي
-                    # الخطوة د: العنوان وحفظ الطلب الفوري وتحديث المخزون في قاعدة البيانات
+                    # الخطوة د: العنوان وحفظ الطلب الفوري وتحديث (خصم) المخزون في قاعدة البيانات
                     elif current_step == "AWAITING_ADDRESS":
                         shipping_address = incoming_text
                         
@@ -734,7 +825,6 @@ async def receive_whatsapp_message(request: Request):
                         quantity = session.get("quantity", 1)
                         total_amount = unit_price * quantity
                         
-                        # سحب اسم العميل الحقيقي المحفوظ في الجلسة
                         customer_name = session.get("customer_name", "عميل واتساب")
 
                         order_payload = {
@@ -777,8 +867,7 @@ async def receive_whatsapp_message(request: Request):
 
                             supabase_admin.table("order_items").insert(item_payload).execute()
 
-                            # 🔄 **التعديل الجديد: خصم الكمية المحجوزه تلقائياً من مخزون المتغيرات (stock_qty)**
-                            # 1. جلب المخزون الحالي للمقاس المحدد
+                            # 🔄 خصم الكمية المحجوزة تلقائياً من مخزون المتغيرات (stock_qty)
                             variant_res = (
                                 supabase_admin.table("product_variants")
                                 .select("id, stock_qty")
@@ -790,33 +879,32 @@ async def receive_whatsapp_message(request: Request):
                             if variant_res.data and len(variant_res.data) > 0:
                                 variant_record = variant_res.data[0]
                                 current_stock = variant_record.get("stock_qty", 0)
-                                new_stock = max(0, current_stock - quantity) # لضمان عدم نزوله تحت الصفر
+                                new_stock = max(0, current_stock - quantity)
 
-                                # 2. تحديث المخزون في قاعدة البيانات
                                 supabase_admin.table("product_variants")\
                                     .update({"stock_qty": new_stock})\
                                     .eq("id", variant_record["id"])\
                                     .execute()
 
-                            # تصفير الجلسة بعد نجاح الطلب
                             USER_SESSIONS.pop(sender_phone, None)
 
                             confirm_reply = (
                                 f"🎉 **تم تسجيل طلبك بنجاح يا {customer_name}!**\n"
                                 f"📦 رقم الطلب التعريفي: `{order_id[:8]}`\n"
                                 f"📍 عنوان الشحن: {shipping_address}\n\n"
-                                f"سيقوم فريق فالنسيا بتجهيز طلبك وتواصل معك قريباً. شكراً لك! 🌸"
+                                f"سيقوم فريق فالنسيا بتجهيز طلبك والتواصل معك قريباً. شكراً لك! 🌸"
                             )
                             await send_whatsapp_message(sender_phone, confirm_reply)
                         else:
                             await send_whatsapp_message(sender_phone, "❌ فشل في حفظ الطلب في قاعدة البيانات. يرجى إعادة المحاولة.")
+
         return {"status": "EVENT_RECEIVED"}
 
     except Exception as e:
         print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
 
-    
+
 # ==================== دالة تحميل وقراءة الباركود من صورة واتساب ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
