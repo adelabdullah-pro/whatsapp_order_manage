@@ -920,7 +920,7 @@ async def receive_whatsapp_message(request: Request):
         print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
 
-# ==================== دالة تحميل وقراءة الباركود من صورة واتساب ====================
+# ==================== دالة تحميل وقراءة الباركود من صورة واتساب (محدثة وذكية) ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
         media_url_endpoint = f"https://graph.facebook.com/v19.0/{media_id}"
@@ -944,21 +944,33 @@ async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            # قراءة الباركود أو الـ QR Code مباشرة عبر OpenCV
-            detector = cv2.QRCodeDetector()
-            val, _, _ = detector.detectAndDecode(img_cv)
-            
-            if val:
-                print(f"تم العثور على باركود: {val}")
-                return val
+            if img_cv is None:
+                return None
 
-            print("⚠️ لم يتم العثور على باركود في الصورة")
+            detector = cv2.QRCodeDetector()
+
+            # 1. المحاولة الأولى: بالطريقة العادية المباشرة
+            val, _, _ = detector.detectAndDecode(img_cv)
+            if val:
+                print(f"تم العثور على باركود بالطريقة العادية: {val}")
+                return val.strip()
+
+            # 2. المحاولة الثانية الذكية: تحسين الصورة (تدرج الرمادي + زيادة التباين CLAHE) لقراءة الصور الصعبة أو الصغيرة
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            
+            val, _, _ = detector.detectAndDecode(enhanced)
+            if val:
+                print(f"تم العثور على باركود بعد تحسين الصورة: {val}")
+                return val.strip()
+
+            print("⚠️ لم يتم العثور على باركود في الصورة حتى بعد التحسين")
             return None
 
     except Exception as e:
         print("❌ خطأ أثناء قراءة الباركود:", repr(e))
         return None
-
 # ==================== ادارة الطلبات ====================
 
 # نماذج البيانات (Pydantic Models) للتحقق من المدخلات
