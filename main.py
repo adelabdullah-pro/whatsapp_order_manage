@@ -547,6 +547,38 @@ async def receive_whatsapp_message(request: Request):
 
                         product = db_res.data[0]
 
+                        # ----------------------------------------------------
+                        # 🚨 التعديل الجديد هنا: التحقق هل المنتج نفد بالكامل من المخزون
+                        # ----------------------------------------------------
+                        all_colors = product.get("product_colors", [])
+                        valid_colors = []
+                        for c in all_colors:
+                            has_stock = any(v.get("stock_qty", 0) > 0 for v in c.get("product_variants", []))
+                            if has_stock:
+                                valid_colors.append(c)
+
+                        if len(valid_colors) == 0:
+                            # البحث عن اسم العميل إن وجد لمخاطبته بلطف
+                            existing_customer_res = (
+                                supabase_admin.table("orders")
+                                .select("customer_name")
+                                .eq("customer_phone", sender_phone)
+                                .not_.eq("customer_name", "عميل واتساب")
+                                .limit(1)
+                                .execute()
+                            )
+                            known_name = existing_customer_res.data[0].get("customer_name") if existing_customer_res.data else None
+                            customer_title = f"يا *{known_name}*" if known_name else "عزيزنا العميل"
+
+                            out_of_stock_msg = (
+                                f"أهلاً بك {customer_title} 🌸\n"
+                                f"يسعدنا جداً اهتمامك بـ (*{product['name']}*) في **فالنسيا**! ✨\n\n"
+                                f"نود إبلاغك بأن هذا المنتج قد **نفد بالكامل حالياً** نظراً للإقبال اللطيف عليه 💎\n\n"
+                                f"نعمل باستمرار على إعادة توفير تشكيلاتنا المميزة، ويمكنك إرسال صورة لمنتج آخر وسنكون سعداء جداً بخدمتك 🌺"
+                            )
+                            await send_whatsapp_message(sender_phone, out_of_stock_msg)
+                            continue
+
                         # 🔍 التحقق هل العميل مسجل مسبقاً برقم هاتفه برقم طلب سابق
                         existing_customer_res = (
                             supabase_admin.table("orders")
