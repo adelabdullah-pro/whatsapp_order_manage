@@ -1089,12 +1089,10 @@ async def get_order_details(
         raise HTTPException(status_code=500, detail=str(e))
 
     
-    
-# 3. تحديث حالة الطلب وتسجيل الحركة في السجل (مصحح)
+# 3. تحديث حالة الطلب وتسجيل الحركة مع إدارة المخزون باتجاهين (الإلغاء والإعادة)
 @app.put("/api/orders/{order_id}/status")
 async def update_order_status(order_id: str, data: OrderStatusUpdate):
     try:
-        # استخدام supabase_admin لتفادي قيود RLS وضمان جلب البيانات وتحديثها بسلاسة
         current_order = supabase_admin.table("orders").select("status").eq("id", order_id).execute()
         if not current_order.data:
             raise HTTPException(status_code=404, detail="الطلب غير موجود")
@@ -1102,10 +1100,8 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
         old_status = current_order.data[0]["status"]
         new_status = data.new_status
         
-        # تجهيز التوقيت الحالي بصيغة ISO الصحيحة لكي تقبلها قاعدة البيانات
         current_time_iso = datetime.now(timezone.utc).isoformat()
         
-        # تجهيز حقول التحديث وتواريخ الحالات بشكل صحيح
         update_data = {
             "status": new_status, 
             "updated_at": current_time_iso
@@ -1122,10 +1118,51 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
             if data.cancellation_reason:
                 update_data["cancellation_reason"] = data.cancellation_reason
 
-        # تنفيذ التحديث في جدول orders باستخدام supabase_admin
+        # 🔄 إدارة المخزون التلقائية بناءً على تغير الحالة:
+        
+        # الحالة الأولى: التحول إلى "ملغي" من حالة نشطة (إعادة الكمية للمخزون)
+        if old_status != "cancelled" and new_status == "cancelled":
+            items_res = supabase_admin.table("order_items").select("*").eq("order_id", order_id).execute()
+            for item in (items_res.data or []):
+                product_id = item.get("product_id")
+                color_name = item.get("color_name")
+                size_label = item.get("size_label")
+                quantity = item.get("quantity", 0)
+                
+                if product_id and color_name and size_label and quantity > 0:
+                    color_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).eq("color_name", color_name).execute()
+                    if color_res.data:
+                        color_id = color_res.data[0]["id"]
+                        variant_res = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id).eq("size_label", size_label).execute()
+                        if variant_res.data:
+                            v_rec = variant_res.data[0]
+                            new_stock = v_rec.get("stock_qty", 0) + quantity  # إرجاع الكمية
+                            supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
+
+        # الحالة الثانية: التحول من "ملغي" إلى أي حالة أخرى نشطة (خصم الكمية من المخزون مرة أخرى)
+        elif old_status == "cancelled" and new_status != "cancelled":
+            items_res = supabase_admin.table("order_items").select("*").eq("order_id", order_id).execute()
+            for item in (items_res.data or []):
+                product_id = item.get("product_id")
+                color_name = item.get("color_name")
+                size_label = item.get("size_label")
+                quantity = item.get("quantity", 0)
+                
+                if product_id and color_name and size_label and quantity > 0:
+                    color_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).eq("color_name", color_name).execute()
+                    if color_res.data:
+                        color_id = color_res.data[0]["id"]
+                        variant_res = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id).eq("size_label", size_label).execute()
+                        if variant_res.data:
+                            v_rec = variant_res.data[0]
+                            current_stock = v_rec.get("stock_qty", 0)
+                            new_stock = max(0, current_stock - quantity)  # خصم الكمية مجدداً
+                            supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
+
+        # تنفيذ التحديث في جدول orders
         supabase_admin.table("orders").update(update_data).eq("id", order_id).execute()
         
-        # تسجيل الحركة في جدول order_logs
+        # تسجيل الحركة في السجل
         supabase_admin.table("order_logs").insert({
             "order_id": order_id,
             "old_status": old_status,
@@ -1135,14 +1172,13 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
 
         return {
             "status": "success",
-            "message": f"تم تحديث حالة الطلب إلى ({new_status}) بنجاح",
+            "message": f"تم تحديث حالة الطلب إلى ({new_status}) بنجاح وتحديث المخزون تلقائياً",
             "old_status": old_status,
             "new_status": new_status
         }
     except Exception as e:
         print("❌ Error updating order status:", repr(e))
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
-
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
