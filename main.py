@@ -920,7 +920,7 @@ async def receive_whatsapp_message(request: Request):
         print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
 
-# ==================== دالة تحميل وقراءة الباركود من صورة واتساب (محدثة وذكية) ====================
+# ==================== دالة تحميل وقراءة الباركود مع القص الذكي للزاوية ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
         media_url_endpoint = f"https://graph.facebook.com/v19.0/{media_id}"
@@ -949,28 +949,44 @@ async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
 
             detector = cv2.QRCodeDetector()
 
-            # 1. المحاولة الأولى: بالطريقة العادية المباشرة
+            # 1️⃣ المحاولة الأولى: فحص الصورة الكاملة مباشرة
             val, _, _ = detector.detectAndDecode(img_cv)
-            if val:
-                print(f"تم العثور على باركود بالطريقة العادية: {val}")
+            if val and val.strip():
+                print(f"✅ تم العثور على باركود من الصورة الكاملة: {val}")
                 return val.strip()
 
-            # 2. المحاولة الثانية الذكية: تحسين الصورة (تدرج الرمادي + زيادة التباين CLAHE) لقراءة الصور الصعبة أو الصغيرة
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            
-            val, _, _ = detector.detectAndDecode(enhanced)
-            if val:
-                print(f"تم العثور على باركود بعد تحسين الصورة: {val}")
-                return val.strip()
+            # 2️⃣ المحاولة الثانية: قص زاوية أسفل اليمين (حيث يتواجد الباركود عادة)
+            h, w, _ = img_cv.shape
+            # تحديد المنطقة السفلى اليمنى (آخر 35% من الارتفاع و 35% من العرض)
+            crop_y1 = int(h * 0.65)
+            crop_x1 = int(w * 0.65)
+            bottom_right_crop = img_cv[crop_y1:h, crop_x1:w]
 
-            print("⚠️ لم يتم العثور على باركود في الصورة حتى بعد التحسين")
+            # تجربة قراءة الزاوية المقصوصة مباشرة
+            val_crop, _, _ = detector.detectAndDecode(bottom_right_crop)
+            if val_crop and val_crop.strip():
+                print(f"✅ تم العثور على باركود بعد قص الزاوية السفلى: {val_crop}")
+                return val_crop.strip()
+
+            # 3️⃣ المحاولة الثالثة: تكبير الزاوية المقصوصة وتعديل التباين (CLAHE)
+            resized_crop = cv2.resize(bottom_right_crop, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            gray_crop = cv2.cvtColor(resized_crop, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced_crop = clahe.apply(gray_crop)
+
+            val_enhanced, _, _ = detector.detectAndDecode(enhanced_crop)
+            if val_enhanced and val_enhanced.strip():
+                print(f"✅ تم العثور على باركود بعد قص وتكبير وتحسين الزاوية: {val_enhanced}")
+                return val_enhanced.strip()
+
+            print("⚠️ لم يتم العثور على باركود في الصورة أو في الزاوية المقصوصة")
             return None
 
     except Exception as e:
         print("❌ خطأ أثناء قراءة الباركود:", repr(e))
         return None
+
+
 # ==================== ادارة الطلبات ====================
 
 # نماذج البيانات (Pydantic Models) للتحقق من المدخلات
