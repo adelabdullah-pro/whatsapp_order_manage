@@ -1289,8 +1289,88 @@ async def create_order(
         print("❌ Error creating POS order:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== نموذج إعدادات المتجر (Store Settings Model) ====================
+class StoreSettingsSchema(BaseModel):
+    store_name: str
+    phone: Optional[str] = ""
+    currency: Optional[str] = "ر.ي (يمني)"
+    low_stock_threshold: Optional[int] = 3
 
+# 1. جلب إعدادات المتجر للتاجر الحالي
+@app.get("/api/settings")
+async def get_store_settings(user_id: str = Depends(get_current_user_id)):
+    try:
+        response = (
+            supabase_admin.table("store_settings")
+            .select("*")
+            .eq("owner_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        
+        if not response.data or len(response.data) == 0:
+            # إرجاع بيانات افتراضية إذا لم يتم إنشاء سجل مسبق لهذا التاجر
+            default_settings = {
+                "store_name": "متجري الجديد",
+                "phone": "",
+                "currency": "ر.ي (يمني)",
+                "low_stock_threshold": 3
+            }
+            return {"status": "success", "data": default_settings}
+            
+        return {"status": "success", "data": response.data[0]}
+    except Exception as e:
+        print("❌ Error fetching store settings:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
+# 2. حفظ أو تحديث إعدادات المتجر للتاجر الحالي
+@app.post("/api/settings")
+async def save_store_settings(
+    settings: StoreSettingsSchema,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        # التحقق هل لدى التاجر سجل إعدادات مسبق أم لا
+        existing = (
+            supabase_admin.table("store_settings")
+            .select("id")
+            .eq("owner_id", user_id)
+            .execute()
+        )
+        
+        payload = {
+            "owner_id": user_id,
+            "store_name": settings.store_name,
+            "phone": settings.phone,
+            "currency": settings.currency,
+            "low_stock_threshold": settings.low_stock_threshold,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if existing.data and len(existing.data) > 0:
+            # تحديث الإعدادات الموجودة
+            res = (
+                supabase_admin.table("store_settings")
+                .update(payload)
+                .eq("owner_id", user_id)
+                .execute()
+            )
+        else:
+            # إدخال إعدادات جديدة لأول مرة
+            res = (
+                supabase_admin.table("store_settings")
+                .insert(payload)
+                .execute()
+            )
+            
+        return {
+            "status": "success",
+            "message": "تم حفظ الإعدادات بنجاح",
+            "data": res.data
+        }
+    except Exception as e:
+        print("❌ Error saving store settings:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
