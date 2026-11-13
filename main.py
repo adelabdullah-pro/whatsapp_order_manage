@@ -1179,6 +1179,123 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
     except Exception as e:
         print("❌ Error updating order status:", repr(e))
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
+
+# ==================== نموذج بيانات إنشاء طلب جديد (البيع الفوري والطلبات) ====================
+class OrderItemSchema(BaseModel):
+    product_id: str
+    product_name: str
+    model_number: Optional[str] = None
+    color_name: Optional[str] = None
+    size_label: Optional[str] = None
+    unit_price: float
+    quantity: int
+
+class CreateOrderSchema(BaseModel):
+    id: Optional[str] = None
+    customer_name: str
+    customer_phone: Optional[str] = "غير متاح"
+    shipping_address: Optional[str] = "مبيع مباشر من المعرض"
+    total: float
+    subtotal: Optional[float] = None
+    discount: Optional[float] = 0.0
+    payment_type: Optional[str] = "cash"
+    order_items: List[OrderItemSchema]
+    status: Optional[str] = "completed"
+
+# ==================== مسار إنشاء طلب جديد (للبيع الفوري POS) ====================
+@app.post("/api/orders")
+async def create_order(
+    order_data: CreateOrderSchema,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        # 1. إدخال الطلب الأساسي في جدول orders
+        order_payload = {
+            "owner_id": user_id,
+            "customer_name": order_data.customer_name,
+            "customer_phone": order_data.customer_phone,
+            "source": "pos", # أو direct
+            "status": order_data.status,
+            "payment_status": "paid" if order_data.status == "completed" else "unpaid",
+            "subtotal": order_data.subtotal or order_data.total,
+            "delivery_fee": 0.00,
+            "discount": order_data.discount or 0.00,
+            "total": order_data.total,
+            "currency": "YER",
+            "shipping_address": order_data.shipping_address,
+            "customer_notes": f"عملية بيع فوري (POS) - طريقة الدفع: {order_data.payment_type}"
+        }
+
+        order_res = supabase_admin.table("orders").insert(order_payload).execute()
+
+        if not order_res.data:
+            raise HTTPException(status_code=400, detail="فشل حفظ الطلب في قاعدة البيانات")
+
+        new_order = order_res.data[0]
+        order_id = new_order["id"]
+
+        # 2. إدخال عناصر الطلب في table order_items وخصم المخزون من product_variants
+        for item in order_data.order_items:
+            line_total = item.unit_price * item.quantity
+            item_payload = {
+                "order_id": order_id,
+                "product_id": item.product_id,
+                "product_name": item.product_name,
+                "model_number": item.model_number,
+                "color_name": item.color_name,
+                "size_label": item.size_label,
+                "unit_price": item.unit_price,
+                "quantity": item.quantity,
+                "line_total": line_total
+            }
+            supabase_admin.table("order_items").insert(item_payload).execute()
+
+            # 3. خصم المخزون تلقائياً إذا كان للمنتج ألوان ومقاسات مسجلة
+            if item.product_id and item.quantity > 0:
+                try:
+                    # محاولة البحث عن المتغير وخصم الكمية
+                    query = supabase_admin.table("product_colors").select("id").eq("product_id", item.product_id)
+                    if item.color_name:
+                        query = query.eq("color_name", item.color_name)
+                    color_res = query.execute()
+
+                    if color_res.data:
+                        for col in color_res.data:
+                            color_id = col["id"]
+                            v_query = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id)
+                            if item.size_label:
+                                v_query = v_query.eq("size_label", item.size_label)
+                            v_res = v_query.execute()
+
+                            if v_res.data:
+                                v_rec = v_res.data[0]
+                                current_stock = v_rec.get("stock_qty", 0)
+                                new_stock = max(0, current_stock - item.quantity)
+                                supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
+                                break # تم الخصم بنجاح
+                except Exception as stock_err:
+                    print("⚠️ تحذير أثناء تحديث المخزون للبيع الفوري:", repr(stock_err))
+
+        return {
+            "status": "success",
+            "message": "تم حفظ طلب البيع الفوري وتحديث المخزون بنجاح",
+            "order_id": order_id,
+            "data": new_order
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error creating POS order:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
