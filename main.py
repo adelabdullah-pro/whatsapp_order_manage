@@ -1323,21 +1323,13 @@ async def get_store_settings(user_id: str = Depends(get_current_user_id)):
         print("❌ Error fetching store settings:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-# 2. حفظ أو تحديث إعدادات المتجر للتاجر الحالي
+# 2. حفظ أو تحديث إعدادات المتجر للتاجر الحالي (باستخدام Upsert)
 @app.post("/api/settings")
 async def save_store_settings(
     settings: StoreSettingsSchema,
     user_id: str = Depends(get_current_user_id)
 ):
     try:
-        # التحقق هل لدى التاجر سجل إعدادات مسبق أم لا
-        existing = (
-            supabase_admin.table("store_settings")
-            .select("id")
-            .eq("owner_id", user_id)
-            .execute()
-        )
-        
         payload = {
             "owner_id": user_id,
             "store_name": settings.store_name,
@@ -1347,21 +1339,12 @@ async def save_store_settings(
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         
-        if existing.data and len(existing.data) > 0:
-            # تحديث الإعدادات الموجودة
-            res = (
-                supabase_admin.table("store_settings")
-                .update(payload)
-                .eq("owner_id", user_id)
-                .execute()
-            )
-        else:
-            # إدخال إعدادات جديدة لأول مرة
-            res = (
-                supabase_admin.table("store_settings")
-                .insert(payload)
-                .execute()
-            )
+        # استخدام upsert المباشر لتحديث السجل أو إدخاله إذا لم يكن موجوداً
+        res = (
+            supabase_admin.table("store_settings")
+            .upsert(payload, on_conflict="owner_id")
+            .execute()
+        )
             
         return {
             "status": "success",
@@ -1371,7 +1354,6 @@ async def save_store_settings(
     except Exception as e:
         print("❌ Error saving store settings:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 
