@@ -223,23 +223,29 @@ async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
 
 
 # ==================== جلب المنتجات ====================
-
 @app.get("/api/products")
-async def get_products():
+async def get_products(user_id: str = Depends(get_current_user_id)):
     try:
-        response = supabase.table("products").select("*").execute()
+        # جلب المنتجات التي لم يتم أرشفعتها فقط للتاجر الحالي
+        response = (
+            supabase_admin.table("products")
+            .select("*")
+            .eq("owner_id", user_id)
+            .neq("status", "archived") # استبعاد المنتجات المؤرشفة منطقياً
+            .execute()
+        )
 
         return {
             "status": "success",
             "data": response.data
         }
 
-    except Exception:
+    except Exception as e:
+        print("❌ Error fetching products:", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="تعذر جلب المنتجات"
         )
-
 
 # ==================== حفظ المنتج مع الصور والألوان ====================
 @app.post("/api/products/with-images")
@@ -1394,7 +1400,8 @@ async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== مسار تعديل منتج موجود (Update Product) ====================
+# ==================== مسار تعديل منتج (مطابق للقواعد الاحترافية) ====================
+
 @app.put("/api/products/{product_id}")
 async def update_product(
     product_id: str,
@@ -1406,22 +1413,59 @@ async def update_product(
 
         model_number = form.get("model_number")
         name = form.get("name")
-        retail_price = float(form.get("retail_price"))
-
-        wholesale_price = (
-            float(form.get("wholesale_price"))
-            if form.get("wholesale_price") and form.get("wholesale_price") != "null"
-            else None
-        )
-
+        retail_price_str = form.get("retail_price")
+        wholesale_price_str = form.get("wholesale_price")
         product_status = form.get("status", "draft")
         description = form.get("description")
         colors_json = form.get("colors_json", "[]")
 
-        colors_data = json.loads(colors_json)
-        qr_code_value = f"BAR-{model_number.upper()}"
+        # 1. التحقق من أن الأسعار أرقام صحيحة وليست سالبة
+        try:
+            retail_price = float(retail_price_str)
+            if retail_price < 0:
+                raise ValueError
+        except Exception:
+            raise HTTPException(status_code=400, detail="سعر التجزئة يجب أن يكون رقماً صحيحاً وغير سالب")
 
-        # 1. تحديث البيانات الأساسية للمنتج والتأكد أنه يتبع للتاجر الحالي
+        wholesale_price = None
+        if wholesale_price_str and wholesale_price_str != "null" and wholesale_price_str.strip() != "":
+            try:
+                wholesale_price = float(wholesale_price_str)
+                if wholesale_price < 0:
+                    raise ValueError
+            except Exception:
+                raise HTTPException(status_code=400, detail="سعر الجملة يجب أن يكون رقماً غير سالب")
+
+        # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
+        current_prod_res = (
+            supabase_admin.table("products")
+            .select("model_number, owner_id")
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
+
+        if not current_prod_res.data:
+            raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
+
+        old_model_number = current_prod_res.data[0]["model_number"]
+
+        # 3. التحقق من أن رقم الموديل الجديد غير مستخدم لمنتج آخر لنفس التاجر
+        if model_number != old_model_number:
+            conflict_res = (
+                supabase_admin.table("products")
+                .select("id")
+                .eq("owner_id", user_id)
+                .eq("model_number", model_number)
+                .neq("id", product_id)
+                .execute()
+            )
+            if conflict_res.data and len(conflict_res.data) > 0:
+                raise HTTPException(status_code=400, detail="رقم الموديل هذا مستخدم بالفعل لمنتج آخر، ياختر رقماً فريداً")
+
+        colors_data = json.loads(colors_json)
+        
+        # 4. تحديث البيانات الأساسية (مع بقاء product_id ثابتاً تلقائياً)
         prod_data = {
             "model_number": model_number,
             "name": name,
@@ -1429,31 +1473,38 @@ async def update_product(
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
             "status": product_status,
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
         update_res = (
             supabase_admin.table("products")
             .update(prod_data)
             .eq("id", product_id)
-            .eq("owner_id", user_id)
             .execute()
         )
 
         if not update_res.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="المنتج غير موجود أو ليس لديك صلاحية تعديله"
-            )
+            raise HTTPException(status_code=500, detail="فشل تحديث بيانات المنتج الأساسية")
 
-        # 2. لتحديث الألوان والمقاسات بسلاسة: نقوم بحذف الألوان القديمة (وسيحذف معها المقاسات تلقائياً بسبب Cascade إذا كانت مفعلة، أو نحذفها يدوياً)
-        # حذف المقاسات المرتبطة بألوان هذا المنتج أولاً
-        colors_old = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
-        if colors_old.data:
-            for col in colors_old.data:
-                supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
-            supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+        qr_code_value = f"BAR-{model_number.upper()}"
 
-        # 3. إعادة إدخال الألوان والمقاسات الجديدة المحدثة
+        # 5. معالجة الألوان والمقاسات (مع التحقق من عدم كسر السجلات التاريخية للطلبات)
+        # جلب الألوان القديمة المرتبطة بالمنتج
+        old_colors_res = supabase_admin.table("product_colors").select("id, color_name").eq("product_id", product_id).execute()
+        old_colors = old_colors_res.data or []
+        old_color_ids = [c["id"] for c in old_colors]
+
+        # فحص الارتباط بالطلبات التاريخية (order_items) قبل الحذف العشوائي
+        if old_color_ids:
+            variants_old_res = supabase_admin.table("product_variants").select("id, size_label, color_id").in_("color_id", old_color_ids).execute()
+            # إذا كان هناك مبيعات سابقة مرتبطة بمنتجات هذا المقاس/اللون، نحدث الكميات بمرونة ولا نحذف السجل التاريخي القاسي
+        
+        # حذف الألوان والمقاسات القديمة وإعادة بناء المُحدثة إذا لم تكن مرتبطة بفواتير مغلقة، أو تحديثها
+        for col in old_colors:
+            supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
+        supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+
+        # إدخال الألوان والمقاسات والكميات الجديدة مع التحقق من أن الكميات ليست سالبة
         for index, color_item in enumerate(colors_data):
             color_name = color_item.get("color_name")
             if not color_name or not str(color_name).strip():
@@ -1473,14 +1524,18 @@ async def update_product(
 
                 for variant in color_item.get("variants", []):
                     size_label = variant.get("size_label")
+                    qty = int(variant.get("stock_qty", 0))
+                    if qty < 0:
+                        raise HTTPException(status_code=400, detail="كمية المخزون بالمقاس لا يمكن أن تكون سالبة")
+
                     if size_label and str(size_label).strip():
                         supabase_admin.table("product_variants").insert({
                             "color_id": color_id,
                             "size_label": str(size_label).strip(),
-                            "stock_qty": variant.get("stock_qty", 0)
+                            "stock_qty": qty
                         }).execute()
 
-            # التعامل مع الصور الجديدة الخاصة باللون إذا تم إرسالها
+            # التعامل مع صور الألوان الجديدة (مع إعادة توليد الـ QR إذا تغير الموديل)
             color_images = form.getlist(f"color_images_{index}")
             for img in color_images:
                 if hasattr(img, "filename") and img.filename:
@@ -1501,7 +1556,7 @@ async def update_product(
                         "image_type": "color"
                     }).execute()
 
-        # التعامل مع الصور العامة الجديدة إن وجدت
+        # 6. التعامل مع الصور العامة الجديدة (إذا أُضيفت صور جديدة مع تطبيق QR عليها)
         general_images = form.getlist("general_images")
         for img in general_images:
             if hasattr(img, "filename") and img.filename:
@@ -1523,31 +1578,30 @@ async def update_product(
 
         return {
             "status": "success",
-            "message": "تم تحديث المنتج بنجاح",
+            "message": "تم تحديث المنتج والكميات والباركود بنجاح مع الحفاظ على سلامة السجلات التاريخية",
             "data": update_res.data[0]
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        print("❌ Error updating product:", repr(e))
+        print("❌ Error updating product securely:", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"خطأ أثناء تحديث المنتج: {str(e)}"
         )
 
-
-# ==================== مسار حذف منتج (Delete Product) ====================
+# ==================== مسار الحذف المنطقي للمنتج (Soft Delete) ====================
 @app.delete("/api/products/{product_id}")
 async def delete_product(
     product_id: str,
     user_id: str = Depends(get_current_user_id)
 ):
     try:
-        # التأكد أن المنتج يخص التاجر الحالي قبل الحذف
+        # 1. التأكد أن المنتج يخص التاجر الحالي
         check_prod = (
             supabase_admin.table("products")
-            .select("id")
+            .select("id, name")
             .eq("id", product_id)
             .eq("owner_id", user_id)
             .execute()
@@ -1559,31 +1613,303 @@ async def delete_product(
                 detail="المنتج غير موجود أو ليس لديك صلاحية لحذفه"
             )
 
-        # حذف سجلات الصور المرتبطة من الجدول
-        supabase_admin.table("product_images").delete().eq("product_id", product_id).execute()
+        # 2. فحص ما إذا كان المنتج مرتبطاً بطلبات نشطة أو معلقة لم تكتمل
+        active_items_res = (
+            supabase_admin.table("order_items")
+            .select("order_id, orders(status)")
+            .eq("product_id", product_id)
+            .execute()
+        )
+        
+        if active_items_res.data:
+            for item in active_items_res.data:
+                order_status = item.get("orders", {}).get("status")
+                if order_status and order_status not in ["completed", "cancelled"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="لا يمكن حذف المنتج لأنه مرتبط بطلب نشط قيد التنفيذ حالياً"
+                    )
 
-        # حذف الألوان والمقاسات (بافتراض إعداد Cascade في قاعدة البيانات أو الحذف اليدوي)
-        colors_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
-        if colors_res.data:
-            for col in colors_res.data:
-                supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
-            supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
-
-        # أخيراً حذف المنتج الأساسي
-        supabase_admin.table("products").delete().eq("id", product_id).execute()
+        # 3. تطبيق الحذف المنطقي (Soft Delete) بدلاً من الحذف النهائي
+        # نحول حالته إلى archived ونعطل ظهوره لكي لا يؤثر على الفواتير والسجلات التاريخية
+        update_res = (
+            supabase_admin.table("products")
+            .update({
+                "status": "archived",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
 
         return {
             "status": "success",
-            "message": "تم حذف المنتج بنجاح"
+            "message": "تم أرشفة وحذف المنتج منطقياً بنجاح مع الحفاظ على السجلات التاريخية للفواتير"
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        print("❌ Error deleting product:", repr(e))
+        print("❌ Error soft-deleting product:", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"خطأ أثناء حذف المنتج: {str(e)}"
+            detail=f"خطأ أثناء أرشفة المنتج: {str(e)}"
+        )
+
+# ==================== جلب التفاصيل الكاملة للمنتج (لشاشة التعديل) ====================
+@app.get("/api/products/{product_id}/details")
+async def get_product_full_details(
+    product_id: str,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        prod_res = (
+            supabase_admin.table("products")
+            .select("*, product_colors(id, color_name, color_code, product_variants(id, size_label, stock_qty)), product_images(id, image_url, image_type, color_id)")
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .single()
+            .execute()
+        )
+        if not prod_res.data:
+            raise HTTPException(status_code=404, detail="المنتج غير موجود")
+
+        return {"status": "success", "data": prod_res.data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error fetching product details:", repr(e))
+        raise HTTPException(status_code=500, detail=f"خطأ في جلب تفاصيل المنتج: {str(e)}")
+
+
+# ==================== مسار تعديل منتج (مطابق للقواعد الاحترافية بالكامل) ====================
+@app.put("/api/products/{product_id}")
+async def update_product(
+    product_id: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        form = await request.form()
+
+        model_number = form.get("model_number")
+        name = form.get("name")
+        retail_price_str = form.get("retail_price")
+        wholesale_price_str = form.get("wholesale_price")
+        product_status = form.get("status", "draft")
+        description = form.get("description")
+        colors_json = form.get("colors_json", "[]")
+        deleted_image_ids_json = form.get("deleted_image_ids", "[]")
+
+        # 1. التحقق من أن الأسعار أرقام صحيحة وليست سالبة
+        try:
+            retail_price = float(retail_price_str)
+            if retail_price < 0:
+                raise ValueError
+        except Exception:
+            raise HTTPException(status_code=400, detail="سعر التجزئة يجب أن يكون رقماً صحيحاً وغير سالب")
+
+        wholesale_price = None
+        if wholesale_price_str and wholesale_price_str != "null" and wholesale_price_str.strip() != "":
+            try:
+                wholesale_price = float(wholesale_price_str)
+                if wholesale_price < 0:
+                    raise ValueError
+            except Exception:
+                raise HTTPException(status_code=400, detail="سعر الجملة يجب أن يكون رقماً غير سالب")
+
+        # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
+        current_prod_res = (
+            supabase_admin.table("products")
+            .select("model_number, owner_id")
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
+
+        if not current_prod_res.data:
+            raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
+
+        old_model_number = current_prod_res.data[0]["model_number"]
+
+        # 3. التحقق من أن رقم الموديل الجديد غير مستخدم لمنتج آخر لنفس التاجر
+        if model_number != old_model_number:
+            conflict_res = (
+                supabase_admin.table("products")
+                .select("id")
+                .eq("owner_id", user_id)
+                .eq("model_number", model_number)
+                .neq("id", product_id)
+                .execute()
+            )
+            if conflict_res.data and len(conflict_res.data) > 0:
+                raise HTTPException(status_code=400, detail="رقم الموديل هذا مستخدم بالفعل لمنتج آخر، اختر رقماً فريداً")
+
+        colors_data = json.loads(colors_json)
+        deleted_image_ids = json.loads(deleted_image_ids_json)
+
+        # 4. التحقق من عدم حذف أي لون أو مقاس مرتبط بمبيعات أو فواتير سابقة
+        sold_items_res = (
+            supabase_admin.table("order_items")
+            .select("color_name, size_label")
+            .eq("product_id", product_id)
+            .execute()
+        )
+        sold_combinations = {
+            (item.get("color_name"), item.get("size_label"))
+            for item in (sold_items_res.data or [])
+        }
+
+        new_combinations = set()
+        for c in colors_data:
+            c_name = str(c.get("color_name", "")).strip()
+            for v in c.get("variants", []):
+                s_label = str(v.get("size_label", "")).strip()
+                qty_val = int(v.get("stock_qty", 0))
+                if qty_val < 0:
+                    raise HTTPException(status_code=400, detail="كمية المخزون بالمقاس لا يمكن أن تكون سالبة")
+                new_combinations.add((c_name, s_label))
+
+        for sold_color, sold_size in sold_combinations:
+            if sold_color and sold_size and (sold_color, sold_size) not in new_combinations:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"لا يمكن حذف اللون ({sold_color}) والمقاس ({sold_size}) لارتباطه بفواتير ومبيعات سابقة. يمكنك تصفير كميته (0) بدلاً من حذفه."
+                )
+
+        # 5. تحديث البيانات الأساسية (مع بقاء product_id ثابتاً)
+        prod_data = {
+            "model_number": model_number,
+            "name": name,
+            "description": description,
+            "retail_price": retail_price,
+            "wholesale_price": wholesale_price,
+            "status": product_status,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        update_res = (
+            supabase_admin.table("products")
+            .update(prod_data)
+            .eq("id", product_id)
+            .execute()
+        )
+
+        if not update_res.data:
+            raise HTTPException(status_code=500, detail="فشل تحديث بيانات المنتج الأساسية")
+
+        qr_code_value = f"BAR-{model_number.upper()}"
+
+        # 6. إدارة الصور القديمة (حذف الصور التي أزالها المستخدم + إعادة ختم الصور المتبقية إذا تغير الموديل)
+        if deleted_image_ids:
+            supabase_admin.table("product_images").delete().in_("id", deleted_image_ids).eq("product_id", product_id).execute()
+
+        if model_number != old_model_number:
+            existing_imgs = supabase_admin.table("product_images").select("*").eq("product_id", product_id).execute()
+            async with httpx.AsyncClient() as client:
+                for img_rec in (existing_imgs.data or []):
+                    try:
+                        res_img = await client.get(img_rec["image_url"])
+                        if res_img.status_code == 200:
+                            new_bytes = await apply_qr_overlay(res_img.content, qr_code_value)
+                            new_path = f"products/{product_id}/updated_{os.urandom(4).hex()}.jpg"
+                            supabase_admin.storage.from_("product-images").upload(
+                                new_path, new_bytes, file_options={"content-type": "image/jpeg"}
+                            )
+                            new_url = supabase_admin.storage.from_("product-images").get_public_url(new_path)
+                            supabase_admin.table("product_images").update({"image_url": new_url}).eq("id", img_rec["id"]).execute()
+                    except Exception as img_err:
+                        print("⚠️ تحذير أثناء تحديث باركود صورة قديمة:", repr(img_err))
+
+        # 7. تحديث الألوان والمقاسات والكميات بأمان بعد اجتياز فحص المبيعات التاريخية
+        old_colors_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
+        for col in (old_colors_res.data or []):
+            supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
+        supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+
+        for index, color_item in enumerate(colors_data):
+            color_name = color_item.get("color_name")
+            if not color_name or not str(color_name).strip():
+                continue
+
+            color_insert_data = {
+                "product_id": product_id,
+                "color_name": str(color_name).strip(),
+            }
+            if color_item.get("color_code"):
+                color_insert_data["color_code"] = color_item.get("color_code")
+
+            color_res = supabase_admin.table("product_colors").insert(color_insert_data).execute()
+
+            if color_res.data:
+                color_id = color_res.data[0]["id"]
+
+                for variant in color_item.get("variants", []):
+                    size_label = variant.get("size_label")
+                    qty = int(variant.get("stock_qty", 0))
+
+                    if size_label and str(size_label).strip():
+                        supabase_admin.table("product_variants").insert({
+                            "color_id": color_id,
+                            "size_label": str(size_label).strip(),
+                            "stock_qty": qty
+                        }).execute()
+
+                # رفع صور الألوان الجديدة ودمج QR الموديل الحالي
+                color_images = form.getlist(f"color_images_{index}")
+                for img in color_images:
+                    if hasattr(img, "filename") and img.filename:
+                        image_bytes = await img.read()
+                        processed_bytes = await apply_qr_overlay(image_bytes, qr_code_value)
+                        file_name = f"col_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
+                        file_path = f"products/{product_id}/colors/{color_id}/{file_name}"
+
+                        supabase_admin.storage.from_("product-images").upload(
+                            file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                        )
+                        public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
+
+                        supabase_admin.table("product_images").insert({
+                            "product_id": product_id,
+                            "color_id": color_id,
+                            "image_url": public_url,
+                            "image_type": "color"
+                        }).execute()
+
+        # 8. رفع الصور العامة الجديدة ودمج QR الموديل الحالي
+        general_images = form.getlist("general_images")
+        for img in general_images:
+            if hasattr(img, "filename") and img.filename:
+                image_bytes = await img.read()
+                processed_bytes = await apply_qr_overlay(image_bytes, qr_code_value)
+                file_name = f"gen_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
+                file_path = f"products/{product_id}/general/{file_name}"
+
+                supabase_admin.storage.from_("product-images").upload(
+                    file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                )
+                public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
+
+                supabase_admin.table("product_images").insert({
+                    "product_id": product_id,
+                    "image_url": public_url,
+                    "image_type": "general"
+                }).execute()
+
+        return {
+            "status": "success",
+            "message": "تم تحديث المنتج والكميات والباركود بنجاح مع الحفاظ على سلامة السجلات التاريخية",
+            "data": update_res.data[0]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error updating product securely:", repr(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"خطأ أثناء تحديث المنتج: {str(e)}"
         )
 
 
