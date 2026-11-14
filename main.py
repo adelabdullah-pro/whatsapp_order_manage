@@ -1361,21 +1361,19 @@ async def save_store_settings(
 @app.get("/api/reports/summary")
 async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
     try:
-        # جلب جميع طلبات التاجر
         orders_res = (
             supabase_admin.table("orders")
             .select("total, subtotal, discount, status, created_at, order_items(quantity, unit_price, product_id)")
             .eq("owner_id", user_id)
             .execute()
         )
-        
+
         orders = orders_res.data or []
-        
+
         total_sales = sum(o.get("total", 0) for o in orders if o.get("status") != "cancelled")
         total_orders_count = len([o for o in orders if o.get("status") != "cancelled"])
         cancelled_orders_count = len([o for o in orders if o.get("status") == "cancelled"])
-        
-        # حساب إجمالي القطع المباعة
+
         total_items_sold = 0
         for order in orders:
             if order.get("status") != "cancelled":
@@ -1394,7 +1392,6 @@ async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
     except Exception as e:
         print("❌ Error fetching reports:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ==================== تشغيل الخادم ====================
 
