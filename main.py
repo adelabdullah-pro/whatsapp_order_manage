@@ -1393,6 +1393,200 @@ async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
         print("❌ Error fetching reports:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==================== مسار تعديل منتج موجود (Update Product) ====================
+@app.put("/api/products/{product_id}")
+async def update_product(
+    product_id: str,
+    request: Request,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        form = await request.form()
+
+        model_number = form.get("model_number")
+        name = form.get("name")
+        retail_price = float(form.get("retail_price"))
+
+        wholesale_price = (
+            float(form.get("wholesale_price"))
+            if form.get("wholesale_price") and form.get("wholesale_price") != "null"
+            else None
+        )
+
+        product_status = form.get("status", "draft")
+        description = form.get("description")
+        colors_json = form.get("colors_json", "[]")
+
+        colors_data = json.loads(colors_json)
+        qr_code_value = f"BAR-{model_number.upper()}"
+
+        # 1. تحديث البيانات الأساسية للمنتج والتأكد أنه يتبع للتاجر الحالي
+        prod_data = {
+            "model_number": model_number,
+            "name": name,
+            "description": description,
+            "retail_price": retail_price,
+            "wholesale_price": wholesale_price,
+            "status": product_status,
+        }
+
+        update_res = (
+            supabase_admin.table("products")
+            .update(prod_data)
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
+
+        if not update_res.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="المنتج غير موجود أو ليس لديك صلاحية تعديله"
+            )
+
+        # 2. لتحديث الألوان والمقاسات بسلاسة: نقوم بحذف الألوان القديمة (وسيحذف معها المقاسات تلقائياً بسبب Cascade إذا كانت مفعلة، أو نحذفها يدوياً)
+        # حذف المقاسات المرتبطة بألوان هذا المنتج أولاً
+        colors_old = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
+        if colors_old.data:
+            for col in colors_old.data:
+                supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
+            supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+
+        # 3. إعادة إدخال الألوان والمقاسات الجديدة المحدثة
+        for index, color_item in enumerate(colors_data):
+            color_name = color_item.get("color_name")
+            if not color_name or not str(color_name).strip():
+                continue
+
+            color_insert_data = {
+                "product_id": product_id,
+                "color_name": str(color_name).strip(),
+            }
+            if color_item.get("color_code"):
+                color_insert_data["color_code"] = color_item.get("color_code")
+
+            color_res = supabase_admin.table("product_colors").insert(color_insert_data).execute()
+
+            if color_res.data:
+                color_id = color_res.data[0]["id"]
+
+                for variant in color_item.get("variants", []):
+                    size_label = variant.get("size_label")
+                    if size_label and str(size_label).strip():
+                        supabase_admin.table("product_variants").insert({
+                            "color_id": color_id,
+                            "size_label": str(size_label).strip(),
+                            "stock_qty": variant.get("stock_qty", 0)
+                        }).execute()
+
+            # التعامل مع الصور الجديدة الخاصة باللون إذا تم إرسالها
+            color_images = form.getlist(f"color_images_{index}")
+            for img in color_images:
+                if hasattr(img, "filename") and img.filename:
+                    image_bytes = await img.read()
+                    processed_bytes = await apply_qr_overlay(image_bytes, qr_code_value)
+                    file_name = f"col_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
+                    file_path = f"products/{product_id}/colors/{color_id}/{file_name}"
+                    
+                    supabase_admin.storage.from_("product-images").upload(
+                        file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                    )
+                    public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
+
+                    supabase_admin.table("product_images").insert({
+                        "product_id": product_id,
+                        "color_id": color_id,
+                        "image_url": public_url,
+                        "image_type": "color"
+                    }).execute()
+
+        # التعامل مع الصور العامة الجديدة إن وجدت
+        general_images = form.getlist("general_images")
+        for img in general_images:
+            if hasattr(img, "filename") and img.filename:
+                image_bytes = await img.read()
+                processed_bytes = await apply_qr_overlay(image_bytes, qr_code_value)
+                file_name = f"gen_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
+                file_path = f"products/{product_id}/general/{file_name}"
+                
+                supabase_admin.storage.from_("product-images").upload(
+                    file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                )
+                public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
+
+                supabase_admin.table("product_images").insert({
+                    "product_id": product_id,
+                    "image_url": public_url,
+                    "image_type": "general"
+                }).execute()
+
+        return {
+            "status": "success",
+            "message": "تم تحديث المنتج بنجاح",
+            "data": update_res.data[0]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error updating product:", repr(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"خطأ أثناء تحديث المنتج: {str(e)}"
+        )
+
+
+# ==================== مسار حذف منتج (Delete Product) ====================
+@app.delete("/api/products/{product_id}")
+async def delete_product(
+    product_id: str,
+    user_id: str = Depends(get_current_user_id)
+):
+    try:
+        # التأكد أن المنتج يخص التاجر الحالي قبل الحذف
+        check_prod = (
+            supabase_admin.table("products")
+            .select("id")
+            .eq("id", product_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
+
+        if not check_prod.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="المنتج غير موجود أو ليس لديك صلاحية لحذفه"
+            )
+
+        # حذف سجلات الصور المرتبطة من الجدول
+        supabase_admin.table("product_images").delete().eq("product_id", product_id).execute()
+
+        # حذف الألوان والمقاسات (بافتراض إعداد Cascade في قاعدة البيانات أو الحذف اليدوي)
+        colors_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
+        if colors_res.data:
+            for col in colors_res.data:
+                supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
+            supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+
+        # أخيراً حذف المنتج الأساسي
+        supabase_admin.table("products").delete().eq("id", product_id).execute()
+
+        return {
+            "status": "success",
+            "message": "تم حذف المنتج بنجاح"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error deleting product:", repr(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"خطأ أثناء حذف المنتج: {str(e)}"
+        )
+
+
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
