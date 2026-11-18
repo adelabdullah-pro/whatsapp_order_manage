@@ -1902,7 +1902,7 @@ async def scan_carton_with_ai(
 
         # 3. تحليل الصورة عبر Google Gemini Flash
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
                 (
