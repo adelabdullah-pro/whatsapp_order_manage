@@ -1,5 +1,7 @@
 import os
 import json
+import hashlib
+import hmac
 import io
 from typing import Optional, List
 from fastapi import (
@@ -10,6 +12,9 @@ from fastapi import (
     Depends,
     Request,
     Response,
+    File,
+    UploadFile,
+
 )
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
@@ -21,7 +26,8 @@ import cv2
 from datetime import datetime, timezone
 import numpy as np
 from difflib import get_close_matches
-
+from google import genai
+from google.genai import types
 
 
 load_dotenv()
@@ -35,19 +41,34 @@ USER_SESSIONS = {}
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-# عميل خاص يتخطى سياسات RLS للعمليات الخلفية بأمان
-supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+
+# التحقق من متغيرات البيئة قبل إنشاء الاتصالات
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
-        "يجب ضبط SUPABASE_URL و SUPABASE_KEY في ملف البيئة"
+        "يجب ضبط SUPABASE_URL و SUPABASE_KEY في متغيرات البيئة"
     )
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError(
+        "يجب ضبط SUPABASE_SERVICE_ROLE_KEY في متغيرات البيئة"
+    )
 
+# اتصال التاجر العادي
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
+
+# اتصال الإدارة للعمليات الخلفية
+supabase_admin: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY
+)
 
 # ==================== إعدادات WhatsApp API ====================
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+META_APP_SECRET = os.getenv("META_APP_SECRET")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
@@ -421,12 +442,38 @@ async def add_product_with_images(
         )
 # ==================== جلب صور المنتجات ====================
 
+# ==================== جلب صور المنتجات ====================
+
 @app.get("/api/product-images")
-async def get_product_images():
+async def get_product_images(
+    user_id: str = Depends(get_current_user_id)
+):
     try:
+        # جلب منتجات التاجر الحالي فقط
+        products_response = (
+            supabase_admin.table("products")
+            .select("id")
+            .eq("owner_id", user_id)
+            .execute()
+        )
+
+        product_ids = [
+            product["id"]
+            for product in (products_response.data or [])
+        ]
+
+        # إذا لم تكن لديه منتجات، نعيد قائمة صور فارغة
+        if not product_ids:
+            return {
+                "status": "success",
+                "data": []
+            }
+
+        # جلب صور منتجات التاجر الحالي فقط
         response = (
-            supabase.table("product_images")
+            supabase_admin.table("product_images")
             .select("*")
+            .in_("product_id", product_ids)
             .execute()
         )
 
@@ -435,12 +482,12 @@ async def get_product_images():
             "data": response.data
         }
 
-    except Exception:
+    except Exception as e:
+        print("❌ Error fetching product images:", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="تعذر جلب صور المنتجات"
         )
-
 
 # ==================== دالة إرسال رسائل واتساب ====================
 async def send_whatsapp_message(to_phone: str, text: str):
@@ -477,19 +524,47 @@ async def verify_whatsapp_webhook(request: Request):
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
-    if mode and token:
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            return Response(content=challenge, media_type="text/plain")
-        raise HTTPException(status_code=403, detail="Verification token mismatch")
-    raise HTTPException(status_code=400, detail="Invalid request")
+    if not WHATSAPP_VERIFY_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook verification is not configured",
+        )
+    if not mode or token is None or challenge is None:
+        raise HTTPException(status_code=400, detail="Invalid request")
+    if mode == "subscribe" and hmac.compare_digest(token, WHATSAPP_VERIFY_TOKEN):
+        return Response(content=challenge, media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Verification token mismatch")
 
+
+def verify_meta_signature(raw_body: bytes, signature: Optional[str]) -> None:
+    if not META_APP_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook signature verification is not configured",
+        )
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing webhook signature")
+
+    expected_signature = "sha256=" + hmac.new(
+        META_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
 
 # ==================== دالة استقبال رسائل واتساب (مصححة ومنظمة) ====================
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
+    raw_body = await request.body()
+    verify_meta_signature(
+        raw_body,
+        request.headers.get("X-Hub-Signature-256"),
+    )
+
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
 
         entry = body.get("entry", [])
         for ent in entry:
@@ -1097,9 +1172,19 @@ async def get_order_details(
     
 # 3. تحديث حالة الطلب وتسجيل الحركة مع إدارة المخزون باتجاهين (الإلغاء والإعادة)
 @app.put("/api/orders/{order_id}/status")
-async def update_order_status(order_id: str, data: OrderStatusUpdate):
+async def update_order_status(
+    order_id: str,
+    data: OrderStatusUpdate,
+    user_id: str = Depends(get_current_user_id)
+):
     try:
-        current_order = supabase_admin.table("orders").select("status").eq("id", order_id).execute()
+        current_order = (
+    supabase_admin.table("orders")
+    .select("status")
+    .eq("id", order_id)
+    .eq("owner_id", user_id)
+    .execute()
+)
         if not current_order.data:
             raise HTTPException(status_code=404, detail="الطلب غير موجود")
             
@@ -1166,7 +1251,7 @@ async def update_order_status(order_id: str, data: OrderStatusUpdate):
                             supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
 
         # تنفيذ التحديث في جدول orders
-        supabase_admin.table("orders").update(update_data).eq("id", order_id).execute()
+        supabase_admin.table("orders").update(update_data).eq("id", order_id).eq("owner_id", user_id).execute()
         
         # تسجيل الحركة في السجل
         supabase_admin.table("order_logs").insert({
@@ -1728,6 +1813,134 @@ async def update_product(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"خطأ أثناء تحديث المنتج: {str(e)}"
         )
+
+
+# ==================== تهيئة اتصال قاعدة البيانات المركزية المستقلة ====================
+CENTRAL_SUPABASE_URL = os.getenv("CENTRAL_SUPABASE_URL")
+CENTRAL_SUPABASE_SERVICE_KEY = os.getenv("CENTRAL_SUPABASE_SERVICE_KEY")
+MERCHANT_ID = os.getenv("MERCHANT_ID")
+My_WHATSAPP_NUMBER = os.getenv("My_WHATSAPP_NUMBER", "+967770000000") # رقم افتراضي احتياطي
+central_supabase: Optional[Client] = None
+if CENTRAL_SUPABASE_URL and CENTRAL_SUPABASE_SERVICE_KEY:
+    central_supabase = create_client(CENTRAL_SUPABASE_URL, CENTRAL_SUPABASE_SERVICE_KEY)
+
+# إعداد عميل Google Gemini Vision AI
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+# دالة لجلب أو تسجيل حصة التاجر في قاعدة البيانات المركزية المنفصلة
+async def _get_or_create_central_quota(merchant_id: str):
+    if not central_supabase:
+        raise HTTPException(
+            status_code=500, 
+            detail="اتصال قاعدة البيانات المركزية غير مهيأ في متغيرات البيئة."
+        )
+    try:
+        res = (
+            central_supabase.table("merchant_quotas")
+            .select("images_used, allowed_limit, is_subscribed")
+            .eq("merchant_id", merchant_id)
+            .execute()
+        )
+        
+        if not res.data or len(res.data) == 0:
+            new_quota = {
+                "merchant_id": merchant_id,
+                "images_used": 0,
+                "allowed_limit": 50,
+                "is_subscribed": 0,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            central_supabase.table("merchant_quotas").insert(new_quota).execute()
+            return 0, 50, 0
+        
+        quota = res.data[0]
+        return (
+            quota.get("images_used", 0), 
+            quota.get("allowed_limit", 50), 
+            quota.get("is_subscribed", 0)
+        )
+    except Exception as e:
+        print("❌ Error in Central DB quota check:", repr(e))
+        raise HTTPException(status_code=500, detail="تعذر التحقق من رصيد التاجر في القاعدة المركزية")
+
+
+# ==================== مسار تحليل الكرتون بـ Vision AI والتحقق من الحصة ====================
+@app.post("/api/scan-carton", dependencies=[Depends(get_current_user_id)])
+async def scan_carton_with_ai(
+    file: UploadFile = File(...),
+):
+    if not MERCHANT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="معرّف التاجر غير مهيأ في متغيرات البيئة.",
+        )
+
+    merchant_id = MERCHANT_ID
+
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="مفتاح GEMINI_API_KEY غير معرّف.")
+
+    try:
+        # 1. التحقق من حصة التاجر في القاعدة المركزية المنفصلة
+        images_used, allowed_limit, is_subscribed = await _get_or_create_central_quota(merchant_id)
+
+        if images_used >= allowed_limit:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error_code": "LIMIT_EXCEEDED",
+                    "message": "عذراً، لقد استهلكت رصيدك المتاح من المسح الذكي. لتفعيل 150 صورة جديدة، يرجى تحويل مبلغ 1.5 دولار إلى حسابنا في بنك الكريمي والتواصل مع المطور عبر الواتساب.",
+                    "whatsapp_number": My_WHATSAPP_NUMBER, # يقرأه من متغير البيئة في Render بنجاح
+                    "subscription_price": "1.5$"
+                }
+            )
+
+        # 2. قراءة الصورة المرسلة من التطبيق
+        image_bytes = await file.read()
+
+        # 3. تحليل الصورة عبر Google Gemini Flash
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
+                (
+                    "استخرج من صورة كرتون الأحذية هذه البيانات بدقة بصيغة JSON فقط: "
+                    "تحتوي على مفتاحين أساسيين: 'model_number' (رقم الموديل مجرداً من الحروف إن وجد)، "
+                    "و 'colors' (قائمة بأسماء الألوان المستخرجة باللغة العربية حصرياً مثل: أسود، بني، عسلي، كحلي، أبيض، رمادي). "
+                    "تجنب تماماً أي ألوان وهمية أو غير واضحة من كود أو تحذيرات الكرتون."
+                ),
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", 
+                temperature=0.1
+            ),
+        )
+
+        # 4. تحديث العداد في القاعدة المركزية بزيادة 1
+        new_used_count = images_used + 1
+        central_supabase.table("merchant_quotas").update({
+            "images_used": new_used_count,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("merchant_id", merchant_id).execute()
+
+        return {
+            "status": "success",
+            "remaining_images": allowed_limit - new_used_count,
+            "data": json.loads(response.text)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ Error in Vision AI scan:", repr(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"فشل معالجة الصورة: {str(e)}"
+        )
+
+
 # ==================== تشغيل الخادم ====================
 
 if __name__ == "__main__":
