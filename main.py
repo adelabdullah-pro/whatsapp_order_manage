@@ -1899,12 +1899,28 @@ async def scan_carton_with_ai(
 
         # 2. قراءة الصورة المرسلة من التطبيق
         image_bytes = await file.read()
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as uploaded_image:
+                image_format = uploaded_image.format
+                uploaded_image.verify()
+            image_mime_type = Image.MIME.get(image_format)
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="الملف المرفوع ليس صورة صالحة.",
+            )
+
+        if not image_mime_type or not image_mime_type.startswith("image/"):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="نوع الصورة المرفوعة غير مدعوم.",
+            )
 
         # 3. تحليل الصورة عبر Google Gemini Flash
         response = gemini_client.models.generate_content(
             model="gemini-3.8-flash",
             contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=file.content_type),
+                types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type),
                 (
                     "استخرج من صورة كرتون الأحذية هذه البيانات بدقة بصيغة JSON فقط: "
                     "تحتوي على مفتاحين أساسيين: 'model_number' (رقم الموديل مجرداً من الحروف إن وجد)، "
