@@ -151,9 +151,6 @@ async def get_current_user_id(
         # استخدام الطريقة المباشرة والآمنة لجلب المستخدم عبر التوكن في Supabase
         user_response = supabase.auth.get_user(token)
         
-        # طباعة تشخيصية في الـ Logs للتأكد من نجاح المصادقة ومعرفة الـ ID المستخرج
-        print("🔍 Auth Response Object:", user_response)
-
         # التعامل مع اختلاف هياكل الاستجابة في مكتبة supabase-py
         user_obj = getattr(user_response, 'user', None) or (user_response.get('user') if isinstance(user_response, dict) else None)
 
