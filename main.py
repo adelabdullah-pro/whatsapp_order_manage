@@ -1822,8 +1822,8 @@ if CENTRAL_SUPABASE_URL and CENTRAL_SUPABASE_SERVICE_KEY:
     central_supabase = create_client(CENTRAL_SUPABASE_URL, CENTRAL_SUPABASE_SERVICE_KEY)
 
 # إعداد عميل Google Gemini Vision AI
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+gemini_client = genai.Client(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # دالة لجلب أو تسجيل حصة التاجر في قاعدة البيانات المركزية المنفصلة
@@ -1877,7 +1877,7 @@ async def scan_carton_with_ai(
     merchant_id = MERCHANT_ID
 
     if not gemini_client:
-        raise HTTPException(status_code=500, detail="مفتاح GEMINI_API_KEY غير معرّف.")
+        raise HTTPException(status_code=500, detail="مفتاح OPENAI_API_KEY غير معرّف.")
 
     try:
         # 1. التحقق من حصة التاجر في القاعدة المركزية المنفصلة
