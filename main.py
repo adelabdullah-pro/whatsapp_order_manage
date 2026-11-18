@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import hashlib
 import hmac
 import io
@@ -26,8 +27,7 @@ import cv2
 from datetime import datetime, timezone
 import numpy as np
 from difflib import get_close_matches
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 
 
 load_dotenv()
@@ -1821,9 +1821,9 @@ central_supabase: Optional[Client] = None
 if CENTRAL_SUPABASE_URL and CENTRAL_SUPABASE_SERVICE_KEY:
     central_supabase = create_client(CENTRAL_SUPABASE_URL, CENTRAL_SUPABASE_SERVICE_KEY)
 
-# إعداد عميل Google Gemini Vision AI
+# إعداد عميل OpenAI Vision AI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-gemini_client = genai.Client(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # دالة لجلب أو تسجيل حصة التاجر في قاعدة البيانات المركزية المنفصلة
@@ -1876,7 +1876,7 @@ async def scan_carton_with_ai(
 
     merchant_id = MERCHANT_ID
 
-    if not gemini_client:
+    if not openai_client:
         raise HTTPException(status_code=500, detail="مفتاح OPENAI_API_KEY غير معرّف.")
 
     try:
@@ -1913,22 +1913,33 @@ async def scan_carton_with_ai(
                 detail="نوع الصورة المرفوعة غير مدعوم.",
             )
 
-        # 3. تحليل الصورة عبر Google Gemini Flash
-        response = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type),
-                (
-                    "استخرج من صورة كرتون الأحذية هذه البيانات بدقة بصيغة JSON فقط: "
-                    "تحتوي على مفتاحين أساسيين: 'model_number' (رقم الموديل مجرداً من الحروف إن وجد)، "
-                    "و 'colors' (قائمة بأسماء الألوان المستخرجة باللغة العربية حصرياً مثل: أسود، بني، عسلي، كحلي، أبيض، رمادي). "
-                    "تجنب تماماً أي ألوان وهمية أو غير واضحة من كود أو تحذيرات الكرتون."
-                ),
+        # 3. تحليل الصورة عبر OpenAI Responses API
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        image_data_url = f"data:{image_mime_type};base64,{image_base64}"
+        response = await openai_client.responses.create(
+            model="gpt-6-luna",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "استخرج من صورة كرتون الأحذية هذه البيانات بدقة بصيغة JSON فقط: "
+                                "تحتوي على مفتاحين أساسيين: 'model_number' (رقم الموديل مجرداً من الحروف إن وجد)، "
+                                "و 'colors' (قائمة بأسماء الألوان المستخرجة باللغة العربية حصرياً مثل: أسود، بني، عسلي، كحلي، أبيض، رمادي). "
+                                "تجنب تماماً أي ألوان وهمية أو غير واضحة من كود أو تحذيرات الكرتون."
+                            ),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": image_data_url,
+                            "detail": "auto",
+                        },
+                    ],
+                }
             ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json", 
-                temperature=0.1
-            ),
+            text={"format": {"type": "json_object"}},
         )
 
         # 4. تحديث العداد في القاعدة المركزية بزيادة 1
@@ -1941,7 +1952,7 @@ async def scan_carton_with_ai(
         return {
             "status": "success",
             "remaining_images": allowed_limit - new_used_count,
-            "data": json.loads(response.text)
+            "data": json.loads(response.output_text)
         }
 
     except HTTPException:
