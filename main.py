@@ -1925,10 +1925,12 @@ async def scan_carton_with_ai(
                         {
                             "type": "input_text",
                             "text": (
-                                "استخرج من صورة كرتون الأحذية هذه البيانات بدقة بصيغة JSON فقط: "
-                                "تحتوي على مفتاحين أساسيين: 'model_number' (رقم الموديل مجرداً من الحروف إن وجد)، "
-                                "و 'colors' (قائمة بأسماء الألوان المستخرجة باللغة العربية حصرياً مثل: أسود، بني، عسلي، كحلي، أبيض، رمادي). "
-                                "تجنب تماماً أي ألوان وهمية أو غير واضحة من كود أو تحذيرات الكرتون."
+                                "اقرأ البيانات المطبوعة على كرتون الحذاء فقط. أعد رقم الموديل كما هو مكتوب "
+                                "بالحروف والأرقام، ولا تخلطه مع الباركود أو رقم المقاس أو أي رقم آخر. "
+                                "استخرج كل لون ظاهر بوضوح، واربط به كل المقاسات والكميات المطبوعة لذلك اللون. "
+                                "لا تخمّن ولا تستنتج قيماً غير ظاهرة؛ استخدم null للرقم أو المقاس أو الكمية "
+                                "التي لا يمكن قراءتها، واستخدم قائمة فارغة إذا لم تظهر ألوان بوضوح. "
+                                "اكتب أسماء الألوان بالعربية، واجعل stock_qty عدداً صحيحاً."
                             ),
                         },
                         {
@@ -1939,7 +1941,53 @@ async def scan_carton_with_ai(
                     ],
                 }
             ],
-            text={"format": {"type": "json_object"}},
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "carton_product_details",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "model_number": {
+                                "type": ["string", "null"],
+                            },
+                            "colors": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "color_name": {"type": "string"},
+                                        "variants": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "size_label": {
+                                                        "type": ["string", "null"],
+                                                    },
+                                                    "stock_qty": {
+                                                        "type": ["integer", "null"],
+                                                    },
+                                                },
+                                                "required": [
+                                                    "size_label",
+                                                    "stock_qty",
+                                                ],
+                                                "additionalProperties": False,
+                                            },
+                                        },
+                                    },
+                                    "required": ["color_name", "variants"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["model_number", "colors"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
         )
 
         # 4. تحديث العداد في القاعدة المركزية بزيادة 1
