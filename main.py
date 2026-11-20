@@ -25,6 +25,7 @@ from PIL import Image
 import httpx
 import cv2
 from datetime import datetime, timezone
+from time import perf_counter
 import numpy as np
 from difflib import get_close_matches
 from openai import AsyncOpenAI
@@ -1879,9 +1880,11 @@ async def scan_carton_with_ai(
     if not openai_client:
         raise HTTPException(status_code=500, detail="مفتاح OPENAI_API_KEY غير معرّف.")
 
+    started_at = perf_counter()
     try:
         # 1. التحقق من حصة التاجر في القاعدة المركزية المنفصلة
         images_used, allowed_limit, is_subscribed = await _get_or_create_central_quota(merchant_id)
+        print(f"Carton scan quota check: {perf_counter() - started_at:.2f}s")
 
         if images_used >= allowed_limit:
             raise HTTPException(
@@ -1916,6 +1919,7 @@ async def scan_carton_with_ai(
         # 3. تحليل الصورة عبر OpenAI Responses API
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
         image_data_url = f"data:{image_mime_type};base64,{image_base64}"
+        model_started_at = perf_counter()
         response = await openai_client.responses.create(
             model="gpt-6-luna",
             input=[
@@ -1925,15 +1929,21 @@ async def scan_carton_with_ai(
                         {
                             "type": "input_text",
                             "text": (
-                                "افحص صورة ملصق/كرتون الحذاء بدقة، واقرأ النصوص والجداول الصغيرة. "
-                                "أعد رقم الموديل أو style/article number كما يظهر حرفياً، مع الحروف "
-                                "والأرقام، ولا تستخدم رقم الباركود أو EAN أو رقم المقاس بدلاً منه. "
-                                "استخرج كل لون مذكور على الملصق أو ظاهر بوضوح في المنتج، واكتب اسمه "
-                                "بالعربية. لكل لون، استخرج كل صف مقاس والكمية المقابلة له من الجدول، "
-                                "وحافظ على الربط الصحيح بين اللون والمقاس والكمية. لا تكرر مقاسات "
-                                "بلون آخر ولا تعتبر الأرقام غير المرتبطة بوضوح كميات. "
-                                "لا تخمّن ولا تملأ معلومات غير مقروءة: استخدم null للقيمة غير "
-                                "المقروءة، و [] عند عدم وجود بيانات واضحة. stock_qty عدد صحيح فقط. "
+                                "اقرأ ملصق كرتون الحذاء بعناية. رقم الموديل هو القيمة المطبوعة بجوار "
+                                "ART NO أو ART.NO. أو ITEM NO أو ITEM.NO. أو MODEL أو STYLE أو "
+                                "ARTICLE أو مسمى واضح آخر لرقم الموديل؛ انقل القيمة حرفياً بكل حروفها "
+                                "وأرقامها وعلاماتها، مع التمييز بين الحروف والأرقام. "
+                                "لا تستخدم الباركود أو المقاس أو رقم الكمية كرقم موديل. "
+                                "قد يكون جدول الكميات مصفوفة: صف SIZE يحتوي المقاسات كرؤوس أعمدة، "
+                                "وكل صف أسفله يبدأ باسم لون وتحت كل مقاس كمية ذلك اللون والمقاس. "
+                                "اقرأ كل صف لون على حدة، وطابق موضع كل رقم كمية مع عمود المقاس فوقه، "
+                                "حتى إذا كانت الأعمدة دون خطوط فاصلة. أنشئ variant لكل تقاطع مقاس "
+                                "ولون تظهر فيه كمية؛ stock_qty هو الرقم في التقاطع وليس رقم المقاس "
+                                "أو إجمالي QTY. لا تنشئ variant لخانة فارغة ولا تنسخ كميات صف لآخر. "
+                                "ترجم أسماء الألوان إلى العربية، واستخدم size_label نصاً وstock_qty "
+                                "عدداً صحيحاً. إذا ظهر المقاس لكن كميته غير مقروءة فاستخدم null للكمية. "
+                                "لا تخمّن رقماً أو كمية غير مقروءة: استخدم null لرقم الموديل غير المؤكد "
+                                "و[] عند عدم ظهور بيانات واضحة. "
                                 "أعد JSON مطابقاً تماماً للمخطط المطلوب."
                             ),
                         },
@@ -1993,6 +2003,7 @@ async def scan_carton_with_ai(
                 }
             },
         )
+        print(f"Carton scan OpenAI request: {perf_counter() - model_started_at:.2f}s")
 
         # 4. تحديث العداد في القاعدة المركزية بزيادة 1
         new_used_count = images_used + 1
@@ -2015,6 +2026,8 @@ async def scan_carton_with_ai(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"فشل معالجة الصورة: {str(e)}"
         )
+    finally:
+        print(f"Carton scan total: {perf_counter() - started_at:.2f}s")
 
 
 # ==================== تشغيل الخادم ====================
