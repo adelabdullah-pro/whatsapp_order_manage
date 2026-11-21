@@ -20,6 +20,7 @@ from fastapi import (
     UploadFile,
 
 )
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -158,7 +159,7 @@ async def get_current_user_id(
 
     try:
         # استخدام الطريقة المباشرة والآمنة لجلب المستخدم عبر التوكن في Supabase
-        user_response = supabase.auth.get_user(token)
+        user_response = await run_in_threadpool(supabase.auth.get_user, token)
         
         # التعامل مع اختلاف هياكل الاستجابة في مكتبة supabase-py
         user_obj = getattr(user_response, 'user', None) or (user_response.get('user') if isinstance(user_response, dict) else None)
@@ -251,7 +252,7 @@ async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
 
 # ==================== جلب المنتجات ====================
 @app.get("/api/products")
-async def get_products(user_id: str = Depends(get_current_user_id)):
+def get_products(user_id: str = Depends(get_current_user_id)):
     try:
         # جلب المنتجات التي لم يتم أرشفعتها فقط للتاجر الحالي
         response = (
@@ -456,7 +457,7 @@ async def add_product_with_images(
 # ==================== جلب صور المنتجات ====================
 
 @app.get("/api/product-images")
-async def get_product_images(
+def get_product_images(
     user_id: str = Depends(get_current_user_id)
 ):
     try:
