@@ -1196,7 +1196,13 @@ class CustomerInvoiceRequest(BaseModel):
 
 def is_invoice_request(text: str) -> bool:
     normalized_text = normalize_order_text(text)
-    return any(term in normalized_text for term in ("فاتورة", "فاتوره", "فواتير", "invoice"))
+    return any(
+        term in normalized_text
+        for term in (
+            "فاتورة", "فاتوره", "فواتير", "invoice",
+            "اجمالي طلبات", "اجمالي طلباتي", "مجموع طلبات", "مجموع طلباتي",
+        )
+    )
 
 
 def _draw_invoice_text(pdf_canvas, x: float, y: float, text: str, font_size: int = 10):
@@ -1753,9 +1759,13 @@ async def get_orders(
     status: Optional[str] = None, 
     search: Optional[str] = None, 
     limit: int = 50,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
+    offset: int = 0,
 ):
     orders = []
+
+    if limit < 1 or limit > 1000 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid pagination parameters")
     
     try:
         print(f"📦 جلب الطلبات للمستخدم برقم ID: {user_id}")
@@ -1766,7 +1776,8 @@ async def get_orders(
             .select("*, order_items(*)")
             .eq("owner_id", user_id)
             .order("created_at", desc=True)
-            .limit(limit)
+            .order("id", desc=True)
+            .range(offset, offset + limit - 1)
         )
         
         if status and status != 'all':
