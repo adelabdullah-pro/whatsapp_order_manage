@@ -4,6 +4,9 @@ import base64
 import hashlib
 import hmac
 import io
+import re
+import unicodedata
+from bidi.algorithm import get_display
 from typing import Optional, List
 from fastapi import (
     FastAPI,
@@ -29,6 +32,11 @@ from time import perf_counter
 import numpy as np
 from difflib import get_close_matches
 from openai import AsyncOpenAI
+import arabic_reshaper
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 
 load_dotenv()
@@ -373,15 +381,20 @@ async def add_product_with_images(
             if color_res.data:
                 color_id = color_res.data[0]["id"]
 
-                for variant in color_item.get("variants", []):
-                    size_label = variant.get("size_label")
+                variants = color_item.get("variants", [])
+                if not variants:
+                    variants = [{
+                        "size_label": "الافتراضي",
+                        "stock_qty": color_item.get("stock_qty", 0),
+                    }]
 
-                    if size_label and str(size_label).strip():
-                        supabase.table("product_variants").insert({
-                            "color_id": color_id,
-                            "size_label": str(size_label).strip(),
-                            "stock_qty": variant.get("stock_qty", 0)
-                        }).execute()
+                for variant in variants:
+                    size_label = str(variant.get("size_label") or "").strip() or "الافتراضي"
+                    supabase.table("product_variants").insert({
+                        "color_id": color_id,
+                        "size_label": size_label,
+                        "stock_qty": variant.get("stock_qty", 0)
+                    }).execute()
 
                 color_images = form.getlist(f"color_images_{index}")
 
@@ -553,8 +566,7 @@ def verify_meta_signature(raw_body: bytes, signature: Optional[str]) -> None:
 
 
 # ==================== دالة استقبال رسائل واتساب (مصححة ومنظمة) ====================
-@app.post("/webhook")
-async def receive_whatsapp_message(request: Request):
+async def _legacy_receive_whatsapp_message(request: Request):
     raw_body = await request.body()
     verify_meta_signature(
         raw_body,
@@ -998,6 +1010,666 @@ async def receive_whatsapp_message(request: Request):
     except Exception as e:
         print("❌ CRITICAL WEBHOOK ERROR:", repr(e))
         return {"status": "error", "details": str(e)}
+
+
+def normalize_order_text(text: str) -> str:
+    normalized = []
+    for character in text.casefold():
+        if unicodedata.category(character) == "Mn":
+            continue
+        try:
+            normalized.append(str(unicodedata.digit(character)))
+            continue
+        except (TypeError, ValueError):
+            pass
+        normalized.append({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي"}.get(character, character))
+    words = re.sub(r"[^\w]+", " ", "".join(normalized)).split()
+    return " ".join(
+        word[2:] if word.startswith("ال") and len(word) > 2 else word
+        for word in words
+    )
+
+
+NO_SIZE_LABELS = {
+    "افتراضي",
+    "بدون مقاس",
+    "مقاس موحد",
+    "موحد",
+    "one size",
+    "free size",
+    "default",
+}
+
+COLOR_TEXT_CANONICAL = {
+    "اسود": "black",
+    "سوداء": "black",
+    "black": "black",
+    "ابيض": "white",
+    "بيضاء": "white",
+    "white": "white",
+    "احمر": "red",
+    "حمراء": "red",
+    "red": "red",
+    "ازرق": "blue",
+    "زرقاء": "blue",
+    "blue": "blue",
+    "اخضر": "green",
+    "خضراء": "green",
+    "green": "green",
+    "اصفر": "yellow",
+    "صفراء": "yellow",
+    "yellow": "yellow",
+    "بني": "brown",
+    "بنية": "brown",
+    "brown": "brown",
+    "وردي": "pink",
+    "وردية": "pink",
+    "pink": "pink",
+    "بنفسجي": "purple",
+    "بنفسجية": "purple",
+    "purple": "purple",
+    "رمادي": "gray",
+    "رمادية": "gray",
+    "gray": "gray",
+    "grey": "gray",
+}
+
+
+def color_terms_match(caption: str, color_name: str) -> bool:
+    normalized_caption = f" {normalize_order_text(caption)} "
+    normalized_name = normalize_order_text(color_name)
+    canonical_name = COLOR_TEXT_CANONICAL.get(normalized_name)
+    accepted_names = {normalized_name}
+    if canonical_name:
+        accepted_names.update(
+            name for name, canonical in COLOR_TEXT_CANONICAL.items()
+            if canonical == canonical_name
+        )
+    return any(f" {name} " in normalized_caption for name in accepted_names)
+
+
+def find_requested_variant(caption: str, colors: list):
+    normalized_caption = f" {normalize_order_text(caption)} "
+    matched_colors = [
+        color for color in colors
+        if color_terms_match(caption, color.get("color_name", ""))
+    ]
+    if len(matched_colors) != 1:
+        return None, None, "color"
+
+    color = matched_colors[0]
+    variants = color.get("product_variants", [])
+    sized_variants = [
+        variant for variant in color.get("product_variants", [])
+        if normalize_order_text(str(variant.get("size_label", ""))) not in NO_SIZE_LABELS
+    ]
+    if sized_variants:
+        matched_variants = [
+            variant for variant in sized_variants
+            if f" {normalize_order_text(str(variant.get('size_label', '')))} " in normalized_caption
+        ]
+        if len(matched_variants) != 1:
+            return color, None, "size"
+        return color, matched_variants[0], None
+
+    default_variants = [
+        variant for variant in variants
+        if normalize_order_text(str(variant.get("size_label", ""))) in NO_SIZE_LABELS
+    ]
+    if len(default_variants) != 1:
+        return color, None, "inventory"
+    return color, default_variants[0], None
+
+
+async def save_whatsapp_order(sender_phone: str, session: dict):
+    variant_id = session["variant_id"]
+    variant_res = (
+        supabase_admin.table("product_variants")
+        .select("id, stock_qty")
+        .eq("id", variant_id)
+        .execute()
+    )
+    if not variant_res.data or (variant_res.data[0].get("stock_qty") or 0) < 1:
+        return None
+
+    variant = variant_res.data[0]
+    current_stock = variant.get("stock_qty", 0)
+    order_total = float(session["retail_price"])
+    customer_name = session["customer_name"]
+    order_payload = {
+        "owner_id": session["owner_id"],
+        "customer_name": customer_name,
+        "customer_phone": sender_phone,
+        "source": "whatsapp",
+        "status": "new",
+        "payment_status": "unpaid",
+        "subtotal": order_total,
+        "delivery_fee": 0.00,
+        "discount": 0.00,
+        "total": order_total,
+        "currency": "YER",
+        "shipping_address": "غير محدد - طلب عبر واتساب",
+        "customer_notes": "طلب واتساب؛ الكمية قطعة واحدة",
+    }
+
+    order_res = supabase_admin.table("orders").insert(order_payload).execute()
+    if not order_res.data:
+        raise RuntimeError("فشل إنشاء الطلب")
+    order_id = order_res.data[0]["id"]
+
+    item_payload = {
+        "order_id": order_id,
+        "product_id": session["product_id"],
+        "product_name": session["product_name"],
+        "model_number": session["model_number"],
+        "color_name": session["color_name"],
+        "size_label": session.get("size_label"),
+        "unit_price": order_total,
+        "quantity": 1,
+        "line_total": order_total,
+    }
+    try:
+        supabase_admin.table("order_items").insert(item_payload).execute()
+        stock_res = (
+            supabase_admin.table("product_variants")
+            .update({"stock_qty": current_stock - 1})
+            .eq("id", variant_id)
+            .eq("stock_qty", current_stock)
+            .select("id")
+            .execute()
+        )
+        if not stock_res.data:
+            supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
+            supabase_admin.table("orders").delete().eq("id", order_id).execute()
+            return None
+    except Exception:
+        supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
+        supabase_admin.table("orders").delete().eq("id", order_id).execute()
+        raise
+    return order_id
+
+
+class CustomerInvoiceRequest(BaseModel):
+    customer_phone: str
+
+
+def is_invoice_request(text: str) -> bool:
+    normalized_text = normalize_order_text(text)
+    return any(term in normalized_text for term in ("فاتورة", "فاتوره", "فواتير", "invoice"))
+
+
+def _draw_invoice_text(pdf_canvas, x: float, y: float, text: str, font_size: int = 10):
+    shaped_text = get_display(arabic_reshaper.reshape(str(text)))
+    pdf_canvas.setFont("Cairo", font_size)
+    pdf_canvas.drawRightString(x, y, shaped_text)
+
+
+def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
+    font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
+    registered_fonts = pdfmetrics.getRegisteredFontNames()
+    if "Cairo" not in registered_fonts:
+        pdfmetrics.registerFont(TTFont("Cairo", os.path.join(font_dir, "Cairo-Regular.ttf")))
+
+    pdf_buffer = io.BytesIO()
+    pdf_canvas = canvas.Canvas(pdf_buffer, pagesize=A4)
+    page_width, page_height = A4
+    currency = invoice.get("currency") or "YER"
+    y = page_height - 48
+
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, "فاتورة مجمعة لحجوزات العميل", 18)
+    y -= 28
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"رقم الفاتورة: {str(invoice['id'])[:8]}", 11)
+    y -= 18
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"العميل: {invoice.get('customer_name', '')}", 11)
+    y -= 18
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"الهاتف: {invoice.get('customer_phone', '')}", 10)
+    y -= 18
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"التاريخ: {invoice.get('created_at', '')[:10]}", 10)
+    y -= 24
+    pdf_canvas.line(42, y, page_width - 42, y)
+    y -= 22
+
+    _draw_invoice_text(pdf_canvas, page_width - 42, y, "المنتج واللون والمقاس", 10)
+    pdf_canvas.drawRightString(page_width - 340, y, "الكمية")
+    pdf_canvas.drawRightString(page_width - 245, y, "سعر الوحدة")
+    pdf_canvas.drawRightString(page_width - 120, y, "الإجمالي")
+    y -= 14
+    pdf_canvas.line(42, y, page_width - 42, y)
+    y -= 18
+
+    for order in orders:
+        order_items = order.get("order_items", [])
+        if order_items:
+            if y < 72:
+                pdf_canvas.showPage()
+                y = page_height - 48
+            order_date = str(order.get("created_at", ""))[:10]
+            _draw_invoice_text(
+                pdf_canvas,
+                page_width - 42,
+                y,
+                f"الحجز {str(order.get('id', ''))[:8]} - {order_date}",
+                9,
+            )
+            y -= 16
+
+        for item in order_items:
+            product_details = [item.get("product_name") or "منتج"]
+            if item.get("color_name"):
+                product_details.append(f"اللون {item['color_name']}")
+            if item.get("size_label"):
+                product_details.append(f"المقاس {item['size_label']}")
+            detail_text = " - ".join(product_details)
+            lines = []
+            remaining = detail_text
+            while len(remaining) > 48:
+                split_at = remaining.rfind(" ", 0, 48)
+                split_at = split_at if split_at > 0 else 48
+                lines.append(remaining[:split_at])
+                remaining = remaining[split_at:].strip()
+            lines.append(remaining)
+
+            if y < 62 + len(lines) * 14:
+                pdf_canvas.showPage()
+                y = page_height - 48
+            for line_index, line in enumerate(lines):
+                _draw_invoice_text(pdf_canvas, page_width - 42, y, line, 9)
+                if line_index == 0:
+                    quantity = item.get("quantity") or 0
+                    unit_price = item.get("unit_price") or 0
+                    line_total = item.get("line_total")
+                    if line_total is None:
+                        line_total = float(unit_price) * int(quantity)
+                    pdf_canvas.drawRightString(page_width - 340, y, str(quantity))
+                    pdf_canvas.drawRightString(page_width - 245, y, f"{unit_price} {currency}")
+                    pdf_canvas.drawRightString(page_width - 120, y, f"{line_total} {currency}")
+                y -= 14
+            y -= 3
+
+    if y < 65:
+        pdf_canvas.showPage()
+        y = page_height - 48
+    pdf_canvas.line(42, y, page_width - 42, y)
+    y -= 24
+    _draw_invoice_text(
+        pdf_canvas,
+        page_width - 42,
+        y,
+        f"الإجمالي الكلي: {invoice.get('total', 0)} {currency}",
+        14,
+    )
+    pdf_canvas.save()
+    return pdf_buffer.getvalue()
+
+
+async def send_whatsapp_document(to_phone: str, document: bytes, filename: str, caption: str) -> bool:
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print("❌ تعذر إرسال الفاتورة: إعدادات WhatsApp غير مكتملة")
+        return False
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    upload_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
+    message_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        upload_response = await client.post(
+            upload_url,
+            headers=headers,
+            data={
+                "messaging_product": "whatsapp",
+                "type": "application/pdf",
+            },
+            files={"file": (filename, document, "application/pdf")},
+        )
+        if upload_response.status_code != 200:
+            print("❌ WhatsApp invoice upload failed:", upload_response.status_code, upload_response.text)
+            return False
+
+        media_id = upload_response.json().get("id")
+        if not media_id:
+            print("❌ WhatsApp invoice upload returned no media id")
+            return False
+
+        send_response = await client.post(
+            message_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": to_phone,
+                "type": "document",
+                "document": {
+                    "id": media_id,
+                    "filename": filename,
+                    "caption": caption,
+                },
+            },
+        )
+        if send_response.status_code != 200:
+            print("❌ WhatsApp invoice delivery failed:", send_response.status_code, send_response.text)
+            return False
+    return True
+
+
+def load_customer_invoice_pdf(invoice_id: str, owner_id: str):
+    invoice_response = (
+        supabase_admin.table("customer_invoices")
+        .select("*")
+        .eq("id", invoice_id)
+        .eq("owner_id", owner_id)
+        .execute()
+    )
+    if not invoice_response.data:
+        return None
+
+    invoice = invoice_response.data[0]
+    orders_response = (
+        supabase_admin.table("orders")
+        .select("*, order_items(*)")
+        .eq("owner_id", owner_id)
+        .eq("invoice_id", invoice_id)
+        .order("created_at")
+        .execute()
+    )
+    orders = orders_response.data or []
+    return invoice, orders, build_customer_invoice_pdf(invoice, orders)
+
+
+async def prepare_customer_invoice(owner_id: str, customer_phone: str):
+    invoice_result = (
+        supabase_admin.rpc(
+            "create_customer_invoice",
+            {"p_owner_id": owner_id, "p_customer_phone": customer_phone},
+        )
+        .execute()
+        .data
+    )
+    if isinstance(invoice_result, list) and invoice_result:
+        invoice_result = invoice_result[0]
+    if not isinstance(invoice_result, dict) or not invoice_result.get("invoice_id"):
+        return None
+
+    invoice_data = load_customer_invoice_pdf(str(invoice_result["invoice_id"]), owner_id)
+    if not invoice_data:
+        raise RuntimeError("تم إنشاء الفاتورة لكن تعذر جلب بياناتها")
+    invoice, _, pdf_bytes = invoice_data
+
+    try:
+        whatsapp_sent = await send_whatsapp_document(
+            customer_phone,
+            pdf_bytes,
+            f"invoice_{str(invoice['id'])[:8]}.pdf",
+            f"فاتورة حجوزاتك رقم {str(invoice['id'])[:8]}",
+        )
+    except httpx.HTTPError as error:
+        print("❌ WhatsApp invoice delivery request failed:", repr(error))
+        whatsapp_sent = False
+    if whatsapp_sent:
+        try:
+            supabase_admin.table("customer_invoices").update(
+                {"status": "sent"}
+            ).eq("id", invoice["id"]).execute()
+        except Exception as error:
+            print("❌ Failed to update invoice delivery status:", repr(error))
+
+    return {
+        "invoice": invoice,
+        "pdf": pdf_bytes,
+        "whatsapp_sent": whatsapp_sent,
+    }
+
+
+@app.post("/api/invoices/customer")
+async def create_customer_invoice_endpoint(
+    request_data: CustomerInvoiceRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        result = await prepare_customer_invoice(user_id, request_data.customer_phone.strip())
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail="لا توجد حجوزات غير مفوترة لهذا العميل",
+            )
+        invoice_id = result["invoice"]["id"]
+        return Response(
+            content=result["pdf"],
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="invoice_{str(invoice_id)[:8]}.pdf"',
+                "X-Invoice-Id": str(invoice_id),
+                "X-WhatsApp-Sent": str(result["whatsapp_sent"]).lower(),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("❌ Failed to create customer invoice:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر إنشاء فاتورة العميل")
+
+
+@app.get("/api/invoices/{invoice_id}/pdf")
+async def get_customer_invoice_pdf(
+    invoice_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        invoice_data = load_customer_invoice_pdf(invoice_id, user_id)
+        if not invoice_data:
+            raise HTTPException(status_code=404, detail="الفاتورة غير موجودة")
+        invoice, _, pdf_bytes = invoice_data
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="invoice_{str(invoice["id"])[:8]}.pdf"',
+                "X-Invoice-Id": str(invoice["id"]),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("❌ Failed to load customer invoice:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر جلب الفاتورة")
+
+
+@app.post("/webhook")
+async def receive_whatsapp_message(request: Request):
+    raw_body = await request.body()
+    verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
+
+    try:
+        body = json.loads(raw_body)
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                for message in change.get("value", {}).get("messages", []):
+                    sender_phone = message.get("from")
+                    if not sender_phone:
+                        continue
+
+                    session = USER_SESSIONS.get(sender_phone, {})
+                    if message.get("type") == "image":
+                        image = message.get("image", {})
+                        barcode_value = await download_and_decode_whatsapp_image(image.get("id"))
+                        if not barcode_value:
+                            await send_whatsapp_message(
+                                sender_phone,
+                                "لم نتمكن من قراءة باركود المنتج. أرسل صورة واضحة للمنتج واكتب اللون والمقاس في وصف الصورة، مثل: أسود 40.",
+                            )
+                            continue
+
+                        model_number = barcode_value.strip()
+                        if model_number.upper().startswith("BAR-"):
+                            model_number = model_number[4:].strip()
+
+                        product_res = (
+                            supabase_admin.table("products")
+                            .select("id, owner_id, model_number, name, retail_price, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
+                            .ilike("model_number", model_number)
+                            .limit(1)
+                            .execute()
+                        )
+                        if not product_res.data:
+                            await send_whatsapp_message(sender_phone, "المنتج غير مسجل لدينا. أرسل صورة منتج آخر.")
+                            continue
+
+                        product = product_res.data[0]
+                        caption = image.get("caption", "")
+                        color, variant, missing = find_requested_variant(
+                            caption, product.get("product_colors", [])
+                        )
+                        if missing == "color":
+                            await send_whatsapp_message(
+                                sender_phone,
+                                "لم أتعرف على اللون في وصف الصورة. أعد إرسالها مع لون المنتج، وأضف المقاس إذا كان مطلوباً.",
+                            )
+                            continue
+                        if missing == "size":
+                            await send_whatsapp_message(
+                                sender_phone,
+                                f"تعرفت على اللون {color['color_name']}، لكن هذا المنتج له مقاسات. أعد إرسال الصورة واكتب المقاس المطلوب بوضوح.",
+                            )
+                            continue
+                        if missing == "inventory":
+                            await send_whatsapp_message(
+                                sender_phone,
+                                f"لا يوجد مخزون مسجل للون {color['color_name']} حالياً. يرجى التواصل مع التاجر لتحديث المخزون.",
+                            )
+                            continue
+                        if (variant.get("stock_qty") or 0) < 1:
+                            requested_variant = (
+                                f"اللون {color['color_name']} والمقاس {variant['size_label']}"
+                                if normalize_order_text(str(variant.get("size_label", ""))) not in NO_SIZE_LABELS
+                                else f"اللون {color['color_name']}"
+                            )
+                            await send_whatsapp_message(
+                                sender_phone,
+                                f"عذراً، {requested_variant} غير متوفر حالياً. أرسل صورة منتج آخر.",
+                            )
+                            continue
+
+                        known_customer_res = (
+                            supabase_admin.table("orders")
+                            .select("customer_name")
+                            .eq("owner_id", product["owner_id"])
+                            .eq("customer_phone", sender_phone)
+                            .not_.eq("customer_name", "عميل واتساب")
+                            .limit(1)
+                            .execute()
+                        )
+                        customer_name = (
+                            known_customer_res.data[0].get("customer_name")
+                            if known_customer_res.data else None
+                        )
+                        session = {
+                            "owner_id": product["owner_id"],
+                            "product_id": product["id"],
+                            "product_name": product["name"],
+                            "model_number": product["model_number"],
+                            "retail_price": product["retail_price"],
+                            "variant_id": variant["id"],
+                            "color_name": color["color_name"],
+                            "size_label": (
+                                None
+                                if normalize_order_text(str(variant.get("size_label", ""))) in NO_SIZE_LABELS
+                                else variant["size_label"]
+                            ),
+                            "customer_name": customer_name,
+                        }
+                        if not customer_name:
+                            USER_SESSIONS[sender_phone] = session
+                            await send_whatsapp_message(
+                                sender_phone,
+                                "المنتج متوفر. أرسل اسمك فقط لإكمال الطلب.",
+                            )
+                            continue
+                    elif message.get("type") == "text":
+                        incoming_text = message.get("text", {}).get("body", "").strip()
+                        if is_invoice_request(incoming_text):
+                            try:
+                                customer_orders = (
+                                    supabase_admin.table("orders")
+                                    .select("owner_id")
+                                    .eq("customer_phone", sender_phone)
+                                    .eq("source", "whatsapp")
+                                    .order("created_at", desc=True)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if not customer_orders.data:
+                                    await send_whatsapp_message(
+                                        sender_phone,
+                                        "لا أجد حجوزات مسجلة بهذا الرقم لإصدار فاتورة لها.",
+                                    )
+                                    continue
+
+                                invoice_result = await prepare_customer_invoice(
+                                    customer_orders.data[0]["owner_id"],
+                                    sender_phone,
+                                )
+                                if not invoice_result:
+                                    await send_whatsapp_message(
+                                        sender_phone,
+                                        "لا توجد حجوزات جديدة غير مفوترة لإضافتها إلى فاتورة.",
+                                    )
+                                elif not invoice_result["whatsapp_sent"]:
+                                    await send_whatsapp_message(
+                                        sender_phone,
+                                        "تم تجهيز الفاتورة، لكن تعذر إرسال ملف PDF حالياً. يرجى المحاولة لاحقاً أو التواصل مع التاجر.",
+                                    )
+                            except Exception as error:
+                                print("❌ Failed to handle WhatsApp invoice request:", repr(error))
+                                await send_whatsapp_message(
+                                    sender_phone,
+                                    "تعذر تجهيز الفاتورة حالياً. يرجى المحاولة لاحقاً.",
+                                )
+                            continue
+
+                        if incoming_text.casefold() in {"إلغاء", "الغاء", "cancel", "reset"}:
+                            USER_SESSIONS.pop(sender_phone, None)
+                            await send_whatsapp_message(sender_phone, "تم إلغاء الطلب الحالي.")
+                            continue
+                        if not session:
+                            await send_whatsapp_message(
+                                sender_phone,
+                                "لبدء الطلب، أرسل صورة المنتج واكتب اللون في وصفها، وأضف المقاس إذا كان مطلوباً.",
+                            )
+                            continue
+                        if not incoming_text:
+                            await send_whatsapp_message(sender_phone, "أرسل اسمك فقط لإكمال الطلب.")
+                            continue
+                        session["customer_name"] = incoming_text
+                    else:
+                        continue
+
+                    try:
+                        order_id = await save_whatsapp_order(sender_phone, session)
+                    except Exception as error:
+                        print("❌ Failed to save WhatsApp order:", repr(error))
+                        await send_whatsapp_message(
+                            sender_phone,
+                            "تعذر تسجيل الطلب حالياً. أعد المحاولة بعد قليل بإرسال صورة المنتج مرة أخرى.",
+                        )
+                        continue
+
+                    if not order_id:
+                        USER_SESSIONS.pop(sender_phone, None)
+                        await send_whatsapp_message(
+                            sender_phone,
+                            "عذراً، نفد هذا المقاس للتو. أرسل صورة منتج آخر.",
+                        )
+                        continue
+
+                    USER_SESSIONS.pop(sender_phone, None)
+                    await send_whatsapp_message(
+                        sender_phone,
+                        f"تم تسجيل طلبك بنجاح يا {session['customer_name']}! رقم الطلب: {str(order_id)[:8]}. الكمية: قطعة واحدة.",
+                    )
+
+        return {"status": "EVENT_RECEIVED"}
+    except Exception as error:
+        print("❌ CRITICAL WEBHOOK ERROR:", repr(error))
+        return {"status": "error"}
+
 
 # ==================== دالة تحميل وقراءة الباركود مع القص الذكي للزاوية ====================
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
