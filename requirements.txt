@@ -10,3 +10,6 @@ opencv-python-headless==4.9.0.80
 email-validator
 python-multipart
 openai
+reportlab
+arabic-reshaper
+python-bidi
