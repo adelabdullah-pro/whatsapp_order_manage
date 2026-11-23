@@ -1205,10 +1205,39 @@ def is_invoice_request(text: str) -> bool:
     )
 
 
+def _invoice_display_text(text: str) -> str:
+    return get_display(arabic_reshaper.reshape(str(text)))
+
+
 def _draw_invoice_text(pdf_canvas, x: float, y: float, text: str, font_size: int = 10):
-    shaped_text = get_display(arabic_reshaper.reshape(str(text)))
+    shaped_text = _invoice_display_text(text)
     pdf_canvas.setFont("Cairo", font_size)
     pdf_canvas.drawRightString(x, y, shaped_text)
+
+
+def _wrap_invoice_text(text: str, width: float, font_size: int) -> list:
+    def fits(value: str) -> bool:
+        return pdfmetrics.stringWidth(_invoice_display_text(value), "Cairo", font_size) <= width
+
+    lines = []
+    current = ""
+    for word in str(text).split():
+        candidate = f"{current} {word}" if current else word
+        if fits(candidate):
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        for character in word:
+            if current and not fits(current + character):
+                lines.append(current)
+                current = character
+            else:
+                current += character
+    if current:
+        lines.append(current)
+    return lines or [""]
 
 
 def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
@@ -1223,42 +1252,60 @@ def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
     currency = invoice.get("currency") or "YER"
     y = page_height - 48
 
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, "فاتورة مجمعة لحجوزات العميل", 18)
-    y -= 28
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"رقم الفاتورة: {str(invoice['id'])[:8]}", 11)
-    y -= 18
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"العميل: {invoice.get('customer_name', '')}", 11)
-    y -= 18
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"الهاتف: {invoice.get('customer_phone', '')}", 10)
-    y -= 18
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, f"التاريخ: {invoice.get('created_at', '')[:10]}", 10)
-    y -= 24
-    pdf_canvas.line(42, y, page_width - 42, y)
-    y -= 22
+    right = page_width - 42
+    column_rights = [right, right - 220, right - 270, right - 375]
+    column_widths = [220, 50, 105, right - 375 - 42]
 
-    _draw_invoice_text(pdf_canvas, page_width - 42, y, "المنتج واللون والمقاس", 10)
-    pdf_canvas.drawRightString(page_width - 340, y, "الكمية")
-    pdf_canvas.drawRightString(page_width - 245, y, "سعر الوحدة")
-    pdf_canvas.drawRightString(page_width - 120, y, "الإجمالي")
-    y -= 14
-    pdf_canvas.line(42, y, page_width - 42, y)
-    y -= 18
+    _draw_invoice_text(pdf_canvas, right, y, "فاتورة مجمعة لحجوزات العميل", 18)
+    y -= 28
+    for text in (
+        f"رقم الفاتورة: {str(invoice['id'])[:8]}",
+        f"العميل: {invoice.get('customer_name') or ''}",
+        f"الهاتف: {invoice.get('customer_phone') or ''}",
+        f"التاريخ: {str(invoice.get('created_at') or '')[:10]}",
+    ):
+        for line in _wrap_invoice_text(text, right - 42, 11):
+            if y < 62:
+                pdf_canvas.showPage()
+                y = page_height - 48
+            _draw_invoice_text(pdf_canvas, right, y, line, 11)
+            y -= 17
+    y -= 8
+
+    def table_header():
+        nonlocal y
+        if y < 100:
+            pdf_canvas.showPage()
+            y = page_height - 48
+        pdf_canvas.line(42, y, right, y)
+        y -= 18
+        for x, label in zip(
+            column_rights, ("المنتج واللون والمقاس", "الكمية", "سعر الوحدة", "الإجمالي")
+        ):
+            _draw_invoice_text(pdf_canvas, x - 5, y, label, 9)
+        y -= 10
+        pdf_canvas.line(42, y, right, y)
+        y -= 18
+
+    def ensure_space():
+        nonlocal y
+        if y < 62:
+            pdf_canvas.showPage()
+            y = page_height - 48
+            table_header()
+
+    table_header()
 
     for order in orders:
         order_items = order.get("order_items", [])
         if order_items:
-            if y < 72:
-                pdf_canvas.showPage()
-                y = page_height - 48
-            order_date = str(order.get("created_at", ""))[:10]
-            _draw_invoice_text(
-                pdf_canvas,
-                page_width - 42,
-                y,
-                f"الحجز {str(order.get('id', ''))[:8]} - {order_date}",
-                9,
-            )
-            y -= 16
+            order_date = str(order.get("created_at") or "")[:10]
+            for line in _wrap_invoice_text(
+                f"الحجز {str(order.get('id', ''))[:8]} - {order_date}", right - 42, 9
+            ):
+                ensure_space()
+                _draw_invoice_text(pdf_canvas, right - 5, y, line, 9)
+                y -= 16
 
         for item in order_items:
             product_details = [item.get("product_name") or "منتج"]
@@ -1266,30 +1313,26 @@ def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
                 product_details.append(f"اللون {item['color_name']}")
             if item.get("size_label"):
                 product_details.append(f"المقاس {item['size_label']}")
-            detail_text = " - ".join(product_details)
-            lines = []
-            remaining = detail_text
-            while len(remaining) > 48:
-                split_at = remaining.rfind(" ", 0, 48)
-                split_at = split_at if split_at > 0 else 48
-                lines.append(remaining[:split_at])
-                remaining = remaining[split_at:].strip()
-            lines.append(remaining)
-
-            if y < 62 + len(lines) * 14:
-                pdf_canvas.showPage()
-                y = page_height - 48
-            for line_index, line in enumerate(lines):
-                _draw_invoice_text(pdf_canvas, page_width - 42, y, line, 9)
-                if line_index == 0:
-                    quantity = item.get("quantity") or 0
-                    unit_price = item.get("unit_price") or 0
-                    line_total = item.get("line_total")
-                    if line_total is None:
-                        line_total = float(unit_price) * int(quantity)
-                    pdf_canvas.drawRightString(page_width - 340, y, str(quantity))
-                    pdf_canvas.drawRightString(page_width - 245, y, f"{unit_price} {currency}")
-                    pdf_canvas.drawRightString(page_width - 120, y, f"{line_total} {currency}")
+            quantity = item.get("quantity") or 0
+            unit_price = item.get("unit_price") or 0
+            line_total = item.get("line_total")
+            if line_total is None:
+                line_total = float(unit_price) * int(quantity)
+            values = (
+                " - ".join(product_details),
+                str(quantity),
+                f"{unit_price} {currency}",
+                f"{line_total} {currency}",
+            )
+            wrapped = [
+                _wrap_invoice_text(value, width - 10, 9)
+                for value, width in zip(values, column_widths)
+            ]
+            for line_index in range(max(len(lines) for lines in wrapped)):
+                ensure_space()
+                for x, lines in zip(column_rights, wrapped):
+                    if line_index < len(lines):
+                        _draw_invoice_text(pdf_canvas, x - 5, y, lines[line_index], 9)
                 y -= 14
             y -= 3
 
@@ -1298,13 +1341,14 @@ def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
         y = page_height - 48
     pdf_canvas.line(42, y, page_width - 42, y)
     y -= 24
-    _draw_invoice_text(
-        pdf_canvas,
-        page_width - 42,
-        y,
-        f"الإجمالي الكلي: {invoice.get('total', 0)} {currency}",
-        14,
-    )
+    for line in _wrap_invoice_text(
+        f"الإجمالي الكلي: {invoice.get('total', 0)} {currency}", right - 42, 14
+    ):
+        if y < 62:
+            pdf_canvas.showPage()
+            y = page_height - 48
+        _draw_invoice_text(pdf_canvas, right, y, line, 14)
+        y -= 18
     pdf_canvas.save()
     return pdf_buffer.getvalue()
 
