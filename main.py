@@ -2030,6 +2030,54 @@ async def update_order_status(
         print("❌ Error updating order status:", repr(e))
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
 
+class OrderPaymentUpdate(BaseModel):
+    paid: bool
+
+
+@app.put("/api/orders/{order_id}/payment")
+async def update_order_payment(
+    order_id: str,
+    data: OrderPaymentUpdate,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        current = (
+            supabase_admin.table("orders")
+            .select("id, status, payment_status, paid_at")
+            .eq("id", order_id)
+            .eq("owner_id", user_id)
+            .execute()
+        )
+        if not current.data:
+            raise HTTPException(status_code=404, detail="الطلب غير موجود")
+        order = current.data[0]
+        if order.get("status") == "cancelled":
+            raise HTTPException(status_code=400, detail="لا يمكن تعديل دفع طلب ملغي")
+        target = "paid" if data.paid else "unpaid"
+        if order.get("payment_status") == target:
+            return {"status": "success", "payment_status": target, "paid_at": order.get("paid_at")}
+
+        paid_at = datetime.now(timezone.utc).isoformat() if data.paid else None
+        query = (
+            supabase_admin.table("orders")
+            .update({"payment_status": target, "paid_at": paid_at})
+            .eq("id", order_id)
+            .eq("owner_id", user_id)
+        )
+        for field in ("status", "payment_status"):
+            value = order.get(field)
+            query = query.is_(field, "null") if value is None else query.eq(field, value)
+        updated = query.execute()
+        if not updated.data:
+            raise HTTPException(status_code=409, detail="تغير الطلب، يرجى تحديثه والمحاولة مجددًا")
+        return {"status": "success", "payment_status": target, "paid_at": paid_at}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("❌ Failed to update order payment:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر تحديث حالة الدفع")
+
+
 # ==================== نموذج بيانات إنشاء طلب جديد (البيع الفوري والطلبات) ====================
 class OrderItemSchema(BaseModel):
     product_id: str
@@ -2067,6 +2115,7 @@ async def create_order(
             "source": "pos", # أو direct
             "status": order_data.status,
             "payment_status": "paid" if order_data.status == "completed" else "unpaid",
+            "paid_at": datetime.now(timezone.utc).isoformat() if order_data.status == "completed" else None,
             "subtotal": order_data.subtotal or order_data.total,
             "delivery_fee": 0.00,
             "discount": order_data.discount or 0.00,
@@ -2207,6 +2256,31 @@ async def save_store_settings(
 
 
 # =============================نموذج التقارير =============================
+
+@app.get("/api/dashboard")
+async def get_dashboard(
+    start: datetime,
+    end: datetime,
+    user_id: str = Depends(get_current_user_id),
+):
+    if start.tzinfo is None or end.tzinfo is None or start >= end:
+        raise HTTPException(status_code=422, detail="فترة المبيعات غير صالحة")
+    try:
+        result = supabase_admin.rpc(
+            "dashboard_summary",
+            {
+                "p_owner_id": user_id,
+                "p_start": start.isoformat(),
+                "p_end": end.isoformat(),
+            },
+        ).execute().data
+        if not isinstance(result, dict):
+            raise RuntimeError("Invalid dashboard summary response")
+        return {"status": "success", "data": result}
+    except Exception as error:
+        print("❌ Failed to load dashboard:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر تحميل بيانات الرئيسية")
+
 
 @app.get("/api/reports/summary")
 async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
