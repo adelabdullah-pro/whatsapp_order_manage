@@ -1381,6 +1381,27 @@ def load_customer_invoice_pdf(invoice_id: str, owner_id: str):
     return invoice, orders, build_customer_invoice_pdf(invoice, orders)
 
 
+async def deliver_customer_invoice(invoice: dict, pdf_bytes: bytes, customer_phone: str) -> bool:
+    try:
+        whatsapp_sent = await send_whatsapp_document(
+            customer_phone,
+            pdf_bytes,
+            f"invoice_{str(invoice['id'])[:8]}.pdf",
+            f"فاتورة حجوزاتك رقم {str(invoice['id'])[:8]}",
+        )
+    except httpx.HTTPError as error:
+        print("❌ WhatsApp invoice delivery request failed:", repr(error))
+        whatsapp_sent = False
+    if whatsapp_sent:
+        try:
+            supabase_admin.table("customer_invoices").update(
+                {"status": "sent"}
+            ).eq("id", invoice["id"]).execute()
+        except Exception as error:
+            print("❌ Failed to update invoice delivery status:", repr(error))
+    return whatsapp_sent
+
+
 async def prepare_customer_invoice(owner_id: str, customer_phone: str):
     invoice_result = (
         supabase_admin.rpc(
@@ -1399,24 +1420,7 @@ async def prepare_customer_invoice(owner_id: str, customer_phone: str):
     if not invoice_data:
         raise RuntimeError("تم إنشاء الفاتورة لكن تعذر جلب بياناتها")
     invoice, _, pdf_bytes = invoice_data
-
-    try:
-        whatsapp_sent = await send_whatsapp_document(
-            customer_phone,
-            pdf_bytes,
-            f"invoice_{str(invoice['id'])[:8]}.pdf",
-            f"فاتورة حجوزاتك رقم {str(invoice['id'])[:8]}",
-        )
-    except httpx.HTTPError as error:
-        print("❌ WhatsApp invoice delivery request failed:", repr(error))
-        whatsapp_sent = False
-    if whatsapp_sent:
-        try:
-            supabase_admin.table("customer_invoices").update(
-                {"status": "sent"}
-            ).eq("id", invoice["id"]).execute()
-        except Exception as error:
-            print("❌ Failed to update invoice delivery status:", repr(error))
+    whatsapp_sent = await deliver_customer_invoice(invoice, pdf_bytes, customer_phone)
 
     return {
         "invoice": invoice,
@@ -1431,12 +1435,33 @@ async def create_customer_invoice_endpoint(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        result = await prepare_customer_invoice(user_id, request_data.customer_phone.strip())
+        customer_phone = request_data.customer_phone.strip()
+        result = await prepare_customer_invoice(user_id, customer_phone)
         if not result:
-            raise HTTPException(
-                status_code=404,
-                detail="لا توجد حجوزات غير مفوترة لهذا العميل",
+            latest = (
+                supabase_admin.table("customer_invoices")
+                .select("id")
+                .eq("owner_id", user_id)
+                .eq("customer_phone", customer_phone)
+                .eq("status", "sent")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
             )
+            if not latest.data:
+                raise HTTPException(
+                    status_code=404,
+                    detail="لا توجد حجوزات غير مفوترة أو فاتورة سابقة لهذا العميل",
+                )
+            invoice_data = load_customer_invoice_pdf(str(latest.data[0]["id"]), user_id)
+            if not invoice_data:
+                raise RuntimeError("تعذر جلب الفاتورة السابقة")
+            invoice, _, pdf_bytes = invoice_data
+            result = {
+                "invoice": invoice,
+                "pdf": pdf_bytes,
+                "whatsapp_sent": await deliver_customer_invoice(invoice, pdf_bytes, customer_phone),
+            }
         invoice_id = result["invoice"]["id"]
         return Response(
             content=result["pdf"],
