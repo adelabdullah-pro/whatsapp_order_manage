@@ -1205,8 +1205,13 @@ def is_invoice_request(text: str) -> bool:
     )
 
 
+_invoice_reshaper = arabic_reshaper.ArabicReshaper(
+    configuration={"use_unshaped_instead_of_isolated": True}
+)
+
+
 def _invoice_display_text(text: str) -> str:
-    return get_display(arabic_reshaper.reshape(str(text)))
+    return get_display(_invoice_reshaper.reshape(str(text)))
 
 
 def _draw_invoice_text(pdf_canvas, x: float, y: float, text: str, font_size: int = 10):
@@ -1256,7 +1261,10 @@ def build_customer_invoice_pdf(invoice: dict, orders: list) -> bytes:
     column_rights = [right, right - 220, right - 270, right - 375]
     column_widths = [220, 50, 105, right - 375 - 42]
 
-    _draw_invoice_text(pdf_canvas, right, y, "فاتورة مجمعة لحجوزات العميل", 18)
+    pdf_canvas.setFont("Cairo", 18)
+    pdf_canvas.drawCentredString(
+        page_width / 2, y, _invoice_display_text("فاتورة مجمعة لحجوزات العميل")
+    )
     y -= 28
     for text in (
         f"رقم الفاتورة: {str(invoice['id'])[:8]}",
