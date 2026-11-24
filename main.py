@@ -7,7 +7,7 @@ import io
 import re
 import unicodedata
 from bidi.algorithm import get_display
-from typing import Optional, List
+from typing import Optional, List, Any
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -75,12 +75,18 @@ supabase_admin: Client = create_client(
     SUPABASE_SERVICE_ROLE_KEY
 )
 
+
+async def _execute_db_query(query: Any) -> Any:
+    return await run_in_threadpool(query.execute)
+
+
 # ==================== إعدادات WhatsApp API ====================
 
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 META_APP_SECRET = os.getenv("META_APP_SECRET")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+MAX_SCAN_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 # ==================== نماذج البيانات ====================
@@ -204,7 +210,7 @@ async def auth_me(
 
 # ==================== دالة توليد ودمج الباركود على الصورة ====================
 
-async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
+def _apply_qr_overlay_sync(image_bytes: bytes, qr_data: str) -> bytes:
     base_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     base_w, base_h = base_image.size
 
@@ -248,6 +254,10 @@ async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
     output_io.seek(0)
 
     return output_io.read()
+
+
+async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
+    return await run_in_threadpool(_apply_qr_overlay_sync, image_bytes, qr_data)
 
 
 # ==================== جلب المنتجات ====================
@@ -312,10 +322,9 @@ async def add_product_with_images(
             "status": product_status,
         }
 
-        prod_res = (
+        prod_res = await _execute_db_query(
             supabase.table("products")
             .insert(prod_data)
-            .execute()
         )
 
         if not prod_res.data:
@@ -345,10 +354,11 @@ async def add_product_with_images(
                     f"products/{product_id}/general/{file_name}"
                 )
 
-                supabase.storage.from_("product-images").upload(
+                await run_in_threadpool(
+                    supabase.storage.from_("product-images").upload,
                     file_path,
                     processed_bytes,
-                    file_options={"content-type": "image/jpeg"}
+                    file_options={"content-type": "image/jpeg"},
                 )
 
                 public_url = (
@@ -357,11 +367,13 @@ async def add_product_with_images(
                     .get_public_url(file_path)
                 )
 
-                supabase.table("product_images").insert({
-                    "product_id": product_id,
-                    "image_url": public_url,
-                    "image_type": "general"
-                }).execute()
+                await _execute_db_query(
+                    supabase.table("product_images").insert({
+                        "product_id": product_id,
+                        "image_url": public_url,
+                        "image_type": "general"
+                    })
+                )
 
         for index, color_item in enumerate(colors_data):
             color_name = color_item.get("color_name")
@@ -377,7 +389,9 @@ async def add_product_with_images(
             if color_item.get("color_code"):
                 color_insert_data["color_code"] = color_item.get("color_code")
 
-            color_res = supabase.table("product_colors").insert(color_insert_data).execute()
+            color_res = await _execute_db_query(
+                supabase.table("product_colors").insert(color_insert_data)
+            )
 
             if color_res.data:
                 color_id = color_res.data[0]["id"]
@@ -391,11 +405,13 @@ async def add_product_with_images(
 
                 for variant in variants:
                     size_label = str(variant.get("size_label") or "").strip() or "الافتراضي"
-                    supabase.table("product_variants").insert({
-                        "color_id": color_id,
-                        "size_label": size_label,
-                        "stock_qty": variant.get("stock_qty", 0)
-                    }).execute()
+                    await _execute_db_query(
+                        supabase.table("product_variants").insert({
+                            "color_id": color_id,
+                            "size_label": size_label,
+                            "stock_qty": variant.get("stock_qty", 0)
+                        })
+                    )
 
                 color_images = form.getlist(f"color_images_{index}")
 
@@ -416,10 +432,11 @@ async def add_product_with_images(
                             f"products/{product_id}/colors/{color_id}/{file_name}"
                         )
 
-                        supabase.storage.from_("product-images").upload(
+                        await run_in_threadpool(
+                            supabase.storage.from_("product-images").upload,
                             file_path,
                             processed_bytes,
-                            file_options={"content-type": "image/jpeg"}
+                            file_options={"content-type": "image/jpeg"},
                         )
 
                         public_url = (
@@ -428,12 +445,14 @@ async def add_product_with_images(
                             .get_public_url(file_path)
                         )
 
-                        supabase.table("product_images").insert({
-                            "product_id": product_id,
-                            "color_id": color_id,
-                            "image_url": public_url,
-                            "image_type": "color"
-                        }).execute()
+                        await _execute_db_query(
+                            supabase.table("product_images").insert({
+                                "product_id": product_id,
+                                "color_id": color_id,
+                                "image_url": public_url,
+                                "image_type": "color"
+                            })
+                        )
 
         return {
             "status": "success",
@@ -616,11 +635,10 @@ async def _legacy_receive_whatsapp_message(request: Request):
                     model_number = barcode_value.replace("BAR-", "").strip()
 
                     # فحص المنتج وجلب بياناته من قاعدة البيانات
-                    db_res = (
+                    db_res = await _execute_db_query(
                         supabase_admin.table("products")
                         .select("*, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
                         .ilike("model_number", model_number)
-                        .execute()
                     )
 
                     if not db_res.data or len(db_res.data) == 0:
@@ -630,13 +648,12 @@ async def _legacy_receive_whatsapp_message(request: Request):
                     product = db_res.data[0]
 
                     # التحقق من اسم العميل المسبق في قاعدة البيانات
-                    existing_customer_res = (
+                    existing_customer_res = await _execute_db_query(
                         supabase_admin.table("orders")
                         .select("customer_name")
                         .eq("customer_phone", sender_phone)
                         .not_.eq("customer_name", "عميل واتساب")
                         .limit(1)
-                        .execute()
                     )
 
                     known_customer_name = None
@@ -917,11 +934,10 @@ async def _legacy_receive_whatsapp_message(request: Request):
                     elif current_step == "AWAITING_ADDRESS":
                         shipping_address = incoming_text
                         
-                        profile_res = (
+                        profile_res = await _execute_db_query(
                             supabase_admin.table("profiles")
                             .select("id")
                             .limit(1)
-                            .execute()
                         )
 
                         if not profile_res.data:
@@ -951,7 +967,9 @@ async def _legacy_receive_whatsapp_message(request: Request):
                             "customer_notes": "طلب عبر محادثة واتساب التلقائية"
                         }
 
-                        order_res = supabase_admin.table("orders").insert(order_payload).execute()
+                        order_res = await _execute_db_query(
+                            supabase_admin.table("orders").insert(order_payload)
+                        )
 
                         if order_res.data:
                             new_order = order_res.data[0]
@@ -973,14 +991,15 @@ async def _legacy_receive_whatsapp_message(request: Request):
                                 "line_total": total_amount
                             }
 
-                            supabase_admin.table("order_items").insert(item_payload).execute()
+                            await _execute_db_query(
+                                supabase_admin.table("order_items").insert(item_payload)
+                            )
 
-                            variant_res = (
+                            variant_res = await _execute_db_query(
                                 supabase_admin.table("product_variants")
                                 .select("id, stock_qty")
                                 .eq("color_id", selected_color_id)
                                 .eq("size_label", selected_size)
-                                .execute()
                             )
 
                             if variant_res.data and len(variant_res.data) > 0:
@@ -988,10 +1007,11 @@ async def _legacy_receive_whatsapp_message(request: Request):
                                 current_stock = variant_record.get("stock_qty", 0)
                                 new_stock = max(0, current_stock - quantity)
 
-                                supabase_admin.table("product_variants")\
-                                    .update({"stock_qty": new_stock})\
-                                    .eq("id", variant_record["id"])\
-                                    .execute()
+                                await _execute_db_query(
+                                    supabase_admin.table("product_variants")
+                                    .update({"stock_qty": new_stock})
+                                    .eq("id", variant_record["id"])
+                                )
 
                             USER_SESSIONS.pop(sender_phone, None)
 
@@ -1122,7 +1142,7 @@ def find_requested_variant(caption: str, colors: list):
     return color, default_variants[0], None
 
 
-async def save_whatsapp_order(sender_phone: str, session: dict):
+def save_whatsapp_order(sender_phone: str, session: dict):
     variant_id = session["variant_id"]
     variant_res = (
         supabase_admin.table("product_variants")
@@ -1446,29 +1466,34 @@ async def deliver_customer_invoice(invoice: dict, pdf_bytes: bytes, customer_pho
         whatsapp_sent = False
     if whatsapp_sent:
         try:
-            supabase_admin.table("customer_invoices").update(
-                {"status": "sent"}
-            ).eq("id", invoice["id"]).execute()
+            await _execute_db_query(
+                supabase_admin.table("customer_invoices")
+                .update({"status": "sent"})
+                .eq("id", invoice["id"])
+            )
         except Exception as error:
             print("❌ Failed to update invoice delivery status:", repr(error))
     return whatsapp_sent
 
 
 async def prepare_customer_invoice(owner_id: str, customer_phone: str):
-    invoice_result = (
+    invoice_result = await _execute_db_query(
         supabase_admin.rpc(
             "create_customer_invoice",
             {"p_owner_id": owner_id, "p_customer_phone": customer_phone},
         )
-        .execute()
-        .data
     )
+    invoice_result = invoice_result.data
     if isinstance(invoice_result, list) and invoice_result:
         invoice_result = invoice_result[0]
     if not isinstance(invoice_result, dict) or not invoice_result.get("invoice_id"):
         return None
 
-    invoice_data = load_customer_invoice_pdf(str(invoice_result["invoice_id"]), owner_id)
+    invoice_data = await run_in_threadpool(
+        load_customer_invoice_pdf,
+        str(invoice_result["invoice_id"]),
+        owner_id,
+    )
     if not invoice_data:
         raise RuntimeError("تم إنشاء الفاتورة لكن تعذر جلب بياناتها")
     invoice, _, pdf_bytes = invoice_data
@@ -1490,7 +1515,7 @@ async def create_customer_invoice_endpoint(
         customer_phone = request_data.customer_phone.strip()
         result = await prepare_customer_invoice(user_id, customer_phone)
         if not result:
-            latest = (
+            latest = await _execute_db_query(
                 supabase_admin.table("customer_invoices")
                 .select("id")
                 .eq("owner_id", user_id)
@@ -1498,14 +1523,17 @@ async def create_customer_invoice_endpoint(
                 .eq("status", "sent")
                 .order("created_at", desc=True)
                 .limit(1)
-                .execute()
             )
             if not latest.data:
                 raise HTTPException(
                     status_code=404,
                     detail="لا توجد حجوزات غير مفوترة أو فاتورة سابقة لهذا العميل",
                 )
-            invoice_data = load_customer_invoice_pdf(str(latest.data[0]["id"]), user_id)
+            invoice_data = await run_in_threadpool(
+                load_customer_invoice_pdf,
+                str(latest.data[0]["id"]),
+                user_id,
+            )
             if not invoice_data:
                 raise RuntimeError("تعذر جلب الفاتورة السابقة")
             invoice, _, pdf_bytes = invoice_data
@@ -1532,7 +1560,7 @@ async def create_customer_invoice_endpoint(
 
 
 @app.get("/api/invoices/{invoice_id}/pdf")
-async def get_customer_invoice_pdf(
+def get_customer_invoice_pdf(
     invoice_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
@@ -1585,12 +1613,11 @@ async def receive_whatsapp_message(request: Request):
                         if model_number.upper().startswith("BAR-"):
                             model_number = model_number[4:].strip()
 
-                        product_res = (
+                        product_res = await _execute_db_query(
                             supabase_admin.table("products")
                             .select("id, owner_id, model_number, name, retail_price, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
                             .ilike("model_number", model_number)
                             .limit(1)
-                            .execute()
                         )
                         if not product_res.data:
                             await send_whatsapp_message(sender_phone, "المنتج غير مسجل لدينا. أرسل صورة منتج آخر.")
@@ -1631,14 +1658,13 @@ async def receive_whatsapp_message(request: Request):
                             )
                             continue
 
-                        known_customer_res = (
+                        known_customer_res = await _execute_db_query(
                             supabase_admin.table("orders")
                             .select("customer_name")
                             .eq("owner_id", product["owner_id"])
                             .eq("customer_phone", sender_phone)
                             .not_.eq("customer_name", "عميل واتساب")
                             .limit(1)
-                            .execute()
                         )
                         customer_name = (
                             known_customer_res.data[0].get("customer_name")
@@ -1670,14 +1696,13 @@ async def receive_whatsapp_message(request: Request):
                         incoming_text = message.get("text", {}).get("body", "").strip()
                         if is_invoice_request(incoming_text):
                             try:
-                                customer_orders = (
+                                customer_orders = await _execute_db_query(
                                     supabase_admin.table("orders")
                                     .select("owner_id")
                                     .eq("customer_phone", sender_phone)
                                     .eq("source", "whatsapp")
                                     .order("created_at", desc=True)
                                     .limit(1)
-                                    .execute()
                                 )
                                 if not customer_orders.data:
                                     await send_whatsapp_message(
@@ -1726,7 +1751,11 @@ async def receive_whatsapp_message(request: Request):
                         continue
 
                     try:
-                        order_id = await save_whatsapp_order(sender_phone, session)
+                        order_id = await run_in_threadpool(
+                            save_whatsapp_order,
+                            sender_phone,
+                            session,
+                        )
                     except Exception as error:
                         print("❌ Failed to save WhatsApp order:", repr(error))
                         await send_whatsapp_message(
@@ -1756,16 +1785,60 @@ async def receive_whatsapp_message(request: Request):
 
 
 # ==================== دالة تحميل وقراءة الباركود مع القص الذكي للزاوية ====================
+def _decode_whatsapp_image(image_bytes: bytes) -> Optional[str]:
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img_cv is None:
+        return None
+
+    detector = cv2.QRCodeDetector()
+
+    val, _, _ = detector.detectAndDecode(img_cv)
+    if val and val.strip():
+        print(f"QR decoded from full image: {val}")
+        return val.strip()
+
+    h, w, _ = img_cv.shape
+    crop_y1 = int(h * 0.65)
+    crop_x1 = int(w * 0.65)
+    bottom_right_crop = img_cv[crop_y1:h, crop_x1:w]
+
+    val_crop, _, _ = detector.detectAndDecode(bottom_right_crop)
+    if val_crop and val_crop.strip():
+        print(f"QR decoded from cropped image: {val_crop}")
+        return val_crop.strip()
+
+    resized_crop = cv2.resize(
+        bottom_right_crop,
+        (0, 0),
+        fx=2.0,
+        fy=2.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    gray_crop = cv2.cvtColor(resized_crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced_crop = clahe.apply(gray_crop)
+
+    val_enhanced, _, _ = detector.detectAndDecode(enhanced_crop)
+    if val_enhanced and val_enhanced.strip():
+        print(f"QR decoded from enhanced crop: {val_enhanced}")
+        return val_enhanced.strip()
+
+    print("QR not found in the original or cropped image")
+    return None
+
+
 async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
     try:
         media_url_endpoint = f"https://graph.facebook.com/v19.0/{media_id}"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-        
+
         async with httpx.AsyncClient() as client:
             res = await client.get(media_url_endpoint, headers=headers)
             if res.status_code != 200:
                 return None
-            
+
             media_data = res.json()
             image_download_url = media_data.get("url")
             if not image_download_url:
@@ -1775,50 +1848,9 @@ async def download_and_decode_whatsapp_image(media_id: str) -> Optional[str]:
             if img_res.status_code != 200:
                 return None
 
-            image_bytes = img_res.content
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-            if img_cv is None:
-                return None
-
-            detector = cv2.QRCodeDetector()
-
-            # 1️⃣ المحاولة الأولى: فحص الصورة الكاملة مباشرة
-            val, _, _ = detector.detectAndDecode(img_cv)
-            if val and val.strip():
-                print(f"✅ تم العثور على باركود من الصورة الكاملة: {val}")
-                return val.strip()
-
-            # 2️⃣ المحاولة الثانية: قص زاوية أسفل اليمين (حيث يتواجد الباركود عادة)
-            h, w, _ = img_cv.shape
-            # تحديد المنطقة السفلى اليمنى (آخر 35% من الارتفاع و 35% من العرض)
-            crop_y1 = int(h * 0.65)
-            crop_x1 = int(w * 0.65)
-            bottom_right_crop = img_cv[crop_y1:h, crop_x1:w]
-
-            # تجربة قراءة الزاوية المقصوصة مباشرة
-            val_crop, _, _ = detector.detectAndDecode(bottom_right_crop)
-            if val_crop and val_crop.strip():
-                print(f"✅ تم العثور على باركود بعد قص الزاوية السفلى: {val_crop}")
-                return val_crop.strip()
-
-            # 3️⃣ المحاولة الثالثة: تكبير الزاوية المقصوصة وتعديل التباين (CLAHE)
-            resized_crop = cv2.resize(bottom_right_crop, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-            gray_crop = cv2.cvtColor(resized_crop, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            enhanced_crop = clahe.apply(gray_crop)
-
-            val_enhanced, _, _ = detector.detectAndDecode(enhanced_crop)
-            if val_enhanced and val_enhanced.strip():
-                print(f"✅ تم العثور على باركود بعد قص وتكبير وتحسين الزاوية: {val_enhanced}")
-                return val_enhanced.strip()
-
-            print("⚠️ لم يتم العثور على باركود في الصورة أو في الزاوية المقصوصة")
-            return None
-
+        return await run_in_threadpool(_decode_whatsapp_image, img_res.content)
     except Exception as e:
-        print("❌ خطأ أثناء قراءة الباركود:", repr(e))
+        print("Failed to download or decode WhatsApp image:", repr(e))
         return None
 
 
@@ -1832,49 +1864,77 @@ class OrderStatusUpdate(BaseModel):
 
 # 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
 @app.get("/api/orders")
-async def get_orders(
+def get_orders(
     status: Optional[str] = None, 
     search: Optional[str] = None, 
     limit: int = 50,
     user_id: str = Depends(get_current_user_id),
     offset: int = 0,
+    customer_phone: Optional[str] = None,
+    order_id: Optional[str] = None,
 ):
-    orders = []
-
     if limit < 1 or limit > 1000 or offset < 0:
         raise HTTPException(status_code=422, detail="Invalid pagination parameters")
     
     try:
-        print(f"📦 جلب الطلبات للمستخدم برقم ID: {user_id}")
-        
-        # 🎯 قم بكتابة واستخدام السطر هنا بدلاً من الاستعلام القديم:
         response = (
             supabase_admin.table("orders")
             .select("*, order_items(*)")
             .eq("owner_id", user_id)
-            .order("created_at", desc=True)
-            .order("id", desc=True)
-            .range(offset, offset + limit - 1)
         )
-        
-        if status and status != 'all':
-            response = response.eq("status", status)
-            
-        query_res = response.execute()
-        orders = query_res.data or []
-        
-        print(f"✅ عدد الطلبات التي تم العثور عليها في قاعدة البيانات: {len(orders)}")
-        
-        if search:
-            search_lower = search.lower()
-            orders = [
-                o for o in orders 
-                if search_lower in str(o.get("order_number", "")).lower() 
-                or search_lower in o.get("customer_name", "").lower() 
-                or search_lower in o.get("customer_phone", "")
-            ]
-            
-        return {"status": "success", "count": len(orders), "data": orders}
+
+        if customer_phone is not None:
+            response = response.eq("customer_phone", customer_phone)
+        if order_id is not None:
+            response = response.eq("id", order_id)
+
+        search_term = (search or "").strip()[:100]
+        pending_filter = "status.eq.pending,status.eq.new,status.is.null"
+        search_filter = None
+        if search_term:
+            escaped_search = (
+                search_term.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            search_filter = (
+                f'customer_name.ilike."%{escaped_search}%",'
+                f'customer_phone.ilike."%{escaped_search}%"'
+            )
+
+        if status and status != "all":
+            if status == "pending":
+                pending_query_filter = (
+                    f"and(or({pending_filter}),or({search_filter}))"
+                    if search_filter
+                    else pending_filter
+                )
+                response = response.or_(pending_query_filter)
+            else:
+                response = response.eq("status", status)
+
+        if search_filter and status != "pending":
+            response = response.or_(search_filter)
+
+        query_res = (
+            response.order("created_at", desc=True)
+            .order("id", desc=True)
+            .range(offset, offset + limit)
+            .execute()
+        )
+        rows = query_res.data or []
+        has_more = len(rows) > limit
+        orders = rows[:limit]
+
+        return {
+            "status": "success",
+            "count": len(orders),
+            "data": orders,
+            "has_more": has_more,
+            "offset": offset,
+            "limit": limit,
+        }
         
     except Exception as e:
         print("❌ Error fetching orders:", repr(e))
@@ -1882,7 +1942,7 @@ async def get_orders(
     
 # 2. 🚀 إضافة المسار المفقود لجلب تفاصيل طلب معين (مطلوب لـ OrderDetailsScreen)
 @app.get("/api/orders/{order_id}")
-async def get_order_details(
+def get_order_details(
     order_id: str,
     user_id: str = Depends(get_current_user_id)
 ):
@@ -1907,7 +1967,6 @@ async def get_order_details(
             .eq("order_id", order_id)
             .execute()
         )
-        
         logs_res = (
             supabase_admin.table("order_logs")
             .select("*")
@@ -1915,11 +1974,11 @@ async def get_order_details(
             .order("created_at", desc=True)
             .execute()
         )
-        
+
         return {
             "order": order_data,
             "items": items_res.data or [],
-            "logs": logs_res.data or []
+            "logs": logs_res.data or [],
         }
         
     except HTTPException:
@@ -1931,101 +1990,37 @@ async def get_order_details(
     
 # 3. تحديث حالة الطلب وتسجيل الحركة مع إدارة المخزون باتجاهين (الإلغاء والإعادة)
 @app.put("/api/orders/{order_id}/status")
-async def update_order_status(
+def update_order_status(
     order_id: str,
     data: OrderStatusUpdate,
     user_id: str = Depends(get_current_user_id)
 ):
     try:
-        current_order = (
-    supabase_admin.table("orders")
-    .select("status")
-    .eq("id", order_id)
-    .eq("owner_id", user_id)
-    .execute()
-)
-        if not current_order.data:
+        result = supabase_admin.rpc(
+            "transition_order_status",
+            {
+                "p_order_id": order_id,
+                "p_owner_id": user_id,
+                "p_new_status": data.new_status,
+                "p_cancellation_reason": data.cancellation_reason or "",
+                "p_notes": data.notes or "",
+            },
+        ).execute().data
+        if isinstance(result, list) and result:
+            result = result[0]
+        if not isinstance(result, dict):
+            raise RuntimeError("Invalid order status transition response")
+        if result.get("not_found"):
             raise HTTPException(status_code=404, detail="الطلب غير موجود")
-            
-        old_status = current_order.data[0]["status"]
-        new_status = data.new_status
-        
-        current_time_iso = datetime.now(timezone.utc).isoformat()
-        
-        update_data = {
-            "status": new_status, 
-            "updated_at": current_time_iso
-        }        
-        
-        if new_status == "processing":
-            update_data["confirmed_at"] = current_time_iso
-        elif new_status == "shipping":
-            update_data["shipped_at"] = current_time_iso
-        elif new_status == "completed":
-            update_data["delivered_at"] = current_time_iso
-        elif new_status == "cancelled":
-            update_data["cancelled_at"] = current_time_iso
-            if data.cancellation_reason:
-                update_data["cancellation_reason"] = data.cancellation_reason
-
-        # 🔄 إدارة المخزون التلقائية بناءً على تغير الحالة:
-        
-        # الحالة الأولى: التحول إلى "ملغي" من حالة نشطة (إعادة الكمية للمخزون)
-        if old_status != "cancelled" and new_status == "cancelled":
-            items_res = supabase_admin.table("order_items").select("*").eq("order_id", order_id).execute()
-            for item in (items_res.data or []):
-                product_id = item.get("product_id")
-                color_name = item.get("color_name")
-                size_label = item.get("size_label")
-                quantity = item.get("quantity", 0)
-                
-                if product_id and color_name and size_label and quantity > 0:
-                    color_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).eq("color_name", color_name).execute()
-                    if color_res.data:
-                        color_id = color_res.data[0]["id"]
-                        variant_res = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id).eq("size_label", size_label).execute()
-                        if variant_res.data:
-                            v_rec = variant_res.data[0]
-                            new_stock = v_rec.get("stock_qty", 0) + quantity  # إرجاع الكمية
-                            supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
-
-        # الحالة الثانية: التحول من "ملغي" إلى أي حالة أخرى نشطة (خصم الكمية من المخزون مرة أخرى)
-        elif old_status == "cancelled" and new_status != "cancelled":
-            items_res = supabase_admin.table("order_items").select("*").eq("order_id", order_id).execute()
-            for item in (items_res.data or []):
-                product_id = item.get("product_id")
-                color_name = item.get("color_name")
-                size_label = item.get("size_label")
-                quantity = item.get("quantity", 0)
-                
-                if product_id and color_name and size_label and quantity > 0:
-                    color_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).eq("color_name", color_name).execute()
-                    if color_res.data:
-                        color_id = color_res.data[0]["id"]
-                        variant_res = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id).eq("size_label", size_label).execute()
-                        if variant_res.data:
-                            v_rec = variant_res.data[0]
-                            current_stock = v_rec.get("stock_qty", 0)
-                            new_stock = max(0, current_stock - quantity)  # خصم الكمية مجدداً
-                            supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
-
-        # تنفيذ التحديث في جدول orders
-        supabase_admin.table("orders").update(update_data).eq("id", order_id).eq("owner_id", user_id).execute()
-        
-        # تسجيل الحركة في السجل
-        supabase_admin.table("order_logs").insert({
-            "order_id": order_id,
-            "old_status": old_status,
-            "new_status": new_status,
-            "notes": data.notes or f"تم تغيير الحالة من {old_status} إلى {new_status}"
-        }).execute()
 
         return {
             "status": "success",
-            "message": f"تم تحديث حالة الطلب إلى ({new_status}) بنجاح وتحديث المخزون تلقائياً",
-            "old_status": old_status,
-            "new_status": new_status
+            "message": f"تم تحديث حالة الطلب إلى ({result['new_status']}) بنجاح وتحديث المخزون تلقائياً",
+            "old_status": result.get("old_status"),
+            "new_status": result["new_status"],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print("❌ Error updating order status:", repr(e))
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
@@ -2035,7 +2030,7 @@ class OrderPaymentUpdate(BaseModel):
 
 
 @app.put("/api/orders/{order_id}/payment")
-async def update_order_payment(
+def update_order_payment(
     order_id: str,
     data: OrderPaymentUpdate,
     user_id: str = Depends(get_current_user_id),
@@ -2102,7 +2097,7 @@ class CreateOrderSchema(BaseModel):
 
 # ==================== مسار إنشاء طلب جديد (للبيع الفوري POS) ====================
 @app.post("/api/orders")
-async def create_order(
+def create_order(
     order_data: CreateOrderSchema,
     user_id: str = Depends(get_current_user_id)
 ):
@@ -2125,19 +2120,10 @@ async def create_order(
             "customer_notes": f"عملية بيع فوري (POS) - طريقة الدفع: {order_data.payment_type}"
         }
 
-        order_res = supabase_admin.table("orders").insert(order_payload).execute()
-
-        if not order_res.data:
-            raise HTTPException(status_code=400, detail="فشل حفظ الطلب في قاعدة البيانات")
-
-        new_order = order_res.data[0]
-        order_id = new_order["id"]
-
-        # 2. إدخال عناصر الطلب في table order_items وخصم المخزون من product_variants
+        items_payload = []
         for item in order_data.order_items:
             line_total = item.unit_price * item.quantity
-            item_payload = {
-                "order_id": order_id,
+            items_payload.append({
                 "product_id": item.product_id,
                 "product_name": item.product_name,
                 "model_number": item.model_number,
@@ -2146,40 +2132,26 @@ async def create_order(
                 "unit_price": item.unit_price,
                 "quantity": item.quantity,
                 "line_total": line_total
-            }
-            supabase_admin.table("order_items").insert(item_payload).execute()
+            })
 
-            # 3. خصم المخزون تلقائياً إذا كان للمنتج ألوان ومقاسات مسجلة
-            if item.product_id and item.quantity > 0:
-                try:
-                    # محاولة البحث عن المتغير وخصم الكمية
-                    query = supabase_admin.table("product_colors").select("id").eq("product_id", item.product_id)
-                    if item.color_name:
-                        query = query.eq("color_name", item.color_name)
-                    color_res = query.execute()
-
-                    if color_res.data:
-                        for col in color_res.data:
-                            color_id = col["id"]
-                            v_query = supabase_admin.table("product_variants").select("id, stock_qty").eq("color_id", color_id)
-                            if item.size_label:
-                                v_query = v_query.eq("size_label", item.size_label)
-                            v_res = v_query.execute()
-
-                            if v_res.data:
-                                v_rec = v_res.data[0]
-                                current_stock = v_rec.get("stock_qty", 0)
-                                new_stock = max(0, current_stock - item.quantity)
-                                supabase_admin.table("product_variants").update({"stock_qty": new_stock}).eq("id", v_rec["id"]).execute()
-                                break # تم الخصم بنجاح
-                except Exception as stock_err:
-                    print("⚠️ تحذير أثناء تحديث المخزون للبيع الفوري:", repr(stock_err))
+        result = supabase_admin.rpc(
+            "create_pos_order",
+            {
+                "p_owner_id": user_id,
+                "p_order_payload": order_payload,
+                "p_items": items_payload,
+            },
+        ).execute().data
+        if isinstance(result, list) and result:
+            result = result[0]
+        if not isinstance(result, dict) or not result.get("order_id") or not result.get("data"):
+            raise RuntimeError("Invalid POS order creation response")
 
         return {
             "status": "success",
             "message": "تم حفظ طلب البيع الفوري وتحديث المخزون بنجاح",
-            "order_id": order_id,
-            "data": new_order
+            "order_id": result["order_id"],
+            "data": result["data"],
         }
 
     except HTTPException:
@@ -2197,7 +2169,7 @@ class StoreSettingsSchema(BaseModel):
 
 # 1. جلب إعدادات المتجر للتاجر الحالي
 @app.get("/api/settings")
-async def get_store_settings(user_id: str = Depends(get_current_user_id)):
+def get_store_settings(user_id: str = Depends(get_current_user_id)):
     try:
         response = (
             supabase_admin.table("store_settings")
@@ -2224,7 +2196,7 @@ async def get_store_settings(user_id: str = Depends(get_current_user_id)):
 
 # 2. حفظ أو تحديث إعدادات المتجر للتاجر الحالي (باستخدام Upsert)
 @app.post("/api/settings")
-async def save_store_settings(
+def save_store_settings(
     settings: StoreSettingsSchema,
     user_id: str = Depends(get_current_user_id)
 ):
@@ -2255,10 +2227,57 @@ async def save_store_settings(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/settings/whatsapp")
+async def get_whatsapp_settings(user_id: str = Depends(get_current_user_id)):
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        return {
+            "status": "success",
+            "data": {
+                "connected": False,
+                "phone_number": None,
+            },
+        }
+
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={"fields": "display_phone_number"},
+            )
+        response.raise_for_status()
+        phone_number = response.json().get("display_phone_number")
+        return {
+            "status": "success",
+            "data": {
+                "connected": True,
+                "phone_number": phone_number,
+            },
+        }
+    except httpx.HTTPStatusError as e:
+        print("❌ WhatsApp connection check failed:", e.response.status_code)
+        return {
+            "status": "success",
+            "data": {
+                "connected": False,
+                "phone_number": None,
+            },
+        }
+    except httpx.RequestError as e:
+        print("❌ WhatsApp connection check request failed:", repr(e))
+        raise HTTPException(
+            status_code=502,
+            detail="تعذر التحقق من اتصال واتساب",
+        )
+
+
 # =============================نموذج التقارير =============================
 
 @app.get("/api/dashboard")
-async def get_dashboard(
+def get_dashboard(
     start: datetime,
     end: datetime,
     user_id: str = Depends(get_current_user_id),
@@ -2283,35 +2302,20 @@ async def get_dashboard(
 
 
 @app.get("/api/reports/summary")
-async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
+def get_sales_reports(user_id: str = Depends(get_current_user_id)):
     try:
-        orders_res = (
-            supabase_admin.table("orders")
-            .select("total, subtotal, discount, status, created_at, order_items(quantity, unit_price, product_id)")
-            .eq("owner_id", user_id)
-            .execute()
-        )
-
-        orders = orders_res.data or []
-
-        total_sales = sum(o.get("total", 0) for o in orders if o.get("status") != "cancelled")
-        total_orders_count = len([o for o in orders if o.get("status") != "cancelled"])
-        cancelled_orders_count = len([o for o in orders if o.get("status") == "cancelled"])
-
-        total_items_sold = 0
-        for order in orders:
-            if order.get("status") != "cancelled":
-                for item in order.get("order_items", []):
-                    total_items_sold += item.get("quantity", 0)
+        summary = supabase_admin.rpc(
+            "sales_report_summary",
+            {"p_owner_id": user_id},
+        ).execute().data
+        if isinstance(summary, list) and summary:
+            summary = summary[0]
+        if not isinstance(summary, dict):
+            raise RuntimeError("Invalid sales summary response")
 
         return {
             "status": "success",
-            "data": {
-                "total_sales": total_sales,
-                "total_orders_count": total_orders_count,
-                "cancelled_orders_count": cancelled_orders_count,
-                "total_items_sold": total_items_sold
-            }
+            "data": summary,
         }
     except Exception as e:
         print("❌ Error fetching reports:", repr(e))
@@ -2320,7 +2324,7 @@ async def get_sales_reports(user_id: str = Depends(get_current_user_id)):
 
 # ==================== مسار الحذف المنطقي للمنتج (Soft Delete) ====================
 @app.delete("/api/products/{product_id}")
-async def delete_product(
+def delete_product(
     product_id: str,
     user_id: str = Depends(get_current_user_id)
 ):
@@ -2386,7 +2390,7 @@ async def delete_product(
 
 # ==================== جلب التفاصيل الكاملة للمنتج (لشاشة التعديل) ====================
 @app.get("/api/products/{product_id}/details")
-async def get_product_full_details(
+def get_product_full_details(
     product_id: str,
     user_id: str = Depends(get_current_user_id)
 ):
@@ -2447,12 +2451,11 @@ async def update_product(
                 raise HTTPException(status_code=400, detail="سعر الجملة يجب أن يكون رقماً غير سالب")
 
         # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
-        current_prod_res = (
+        current_prod_res = await _execute_db_query(
             supabase_admin.table("products")
             .select("model_number, owner_id")
             .eq("id", product_id)
             .eq("owner_id", user_id)
-            .execute()
         )
 
         if not current_prod_res.data:
@@ -2462,13 +2465,12 @@ async def update_product(
 
         # 3. التحقق من أن رقم الموديل الجديد غير مستخدم لمنتج آخر لنفس التاجر
         if model_number != old_model_number:
-            conflict_res = (
+            conflict_res = await _execute_db_query(
                 supabase_admin.table("products")
                 .select("id")
                 .eq("owner_id", user_id)
                 .eq("model_number", model_number)
                 .neq("id", product_id)
-                .execute()
             )
             if conflict_res.data and len(conflict_res.data) > 0:
                 raise HTTPException(status_code=400, detail="رقم الموديل هذا مستخدم بالفعل لمنتج آخر، اختر رقماً فريداً")
@@ -2477,11 +2479,10 @@ async def update_product(
         deleted_image_ids = json.loads(deleted_image_ids_json)
 
         # 4. التحقق من عدم حذف أي لون أو مقاس مرتبط بمبيعات أو فواتير سابقة
-        sold_items_res = (
+        sold_items_res = await _execute_db_query(
             supabase_admin.table("order_items")
             .select("color_name, size_label")
             .eq("product_id", product_id)
-            .execute()
         )
         sold_combinations = {
             (item.get("color_name"), item.get("size_label"))
@@ -2518,11 +2519,10 @@ async def update_product(
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
-        update_res = (
+        update_res = await _execute_db_query(
             supabase_admin.table("products")
             .update(prod_data)
             .eq("id", product_id)
-            .execute()
         )
 
         if not update_res.data:
@@ -2532,10 +2532,19 @@ async def update_product(
 
         # 6. إدارة الصور القديمة (حذف الصور التي أزالها المستخدم + إعادة ختم الصور المتبقية إذا تغير الموديل)
         if deleted_image_ids:
-            supabase_admin.table("product_images").delete().in_("id", deleted_image_ids).eq("product_id", product_id).execute()
+            await _execute_db_query(
+                supabase_admin.table("product_images")
+                .delete()
+                .in_("id", deleted_image_ids)
+                .eq("product_id", product_id)
+            )
 
         if model_number != old_model_number:
-            existing_imgs = supabase_admin.table("product_images").select("*").eq("product_id", product_id).execute()
+            existing_imgs = await _execute_db_query(
+                supabase_admin.table("product_images")
+                .select("*")
+                .eq("product_id", product_id)
+            )
             async with httpx.AsyncClient() as client:
                 for img_rec in (existing_imgs.data or []):
                     try:
@@ -2543,19 +2552,38 @@ async def update_product(
                         if res_img.status_code == 200:
                             new_bytes = await apply_qr_overlay(res_img.content, qr_code_value)
                             new_path = f"products/{product_id}/updated_{os.urandom(4).hex()}.jpg"
-                            supabase_admin.storage.from_("product-images").upload(
-                                new_path, new_bytes, file_options={"content-type": "image/jpeg"}
+                            await run_in_threadpool(
+                                supabase_admin.storage.from_("product-images").upload,
+                                new_path,
+                                new_bytes,
+                                file_options={"content-type": "image/jpeg"},
                             )
                             new_url = supabase_admin.storage.from_("product-images").get_public_url(new_path)
-                            supabase_admin.table("product_images").update({"image_url": new_url}).eq("id", img_rec["id"]).execute()
+                            await _execute_db_query(
+                                supabase_admin.table("product_images")
+                                .update({"image_url": new_url})
+                                .eq("id", img_rec["id"])
+                            )
                     except Exception as img_err:
                         print("⚠️ تحذير أثناء تحديث باركود صورة قديمة:", repr(img_err))
 
         # 7. تحديث الألوان والمقاسات والكميات بأمان بعد اجتياز فحص المبيعات التاريخية
-        old_colors_res = supabase_admin.table("product_colors").select("id").eq("product_id", product_id).execute()
+        old_colors_res = await _execute_db_query(
+            supabase_admin.table("product_colors")
+            .select("id")
+            .eq("product_id", product_id)
+        )
         for col in (old_colors_res.data or []):
-            supabase_admin.table("product_variants").delete().eq("color_id", col["id"]).execute()
-        supabase_admin.table("product_colors").delete().eq("product_id", product_id).execute()
+            await _execute_db_query(
+                supabase_admin.table("product_variants")
+                .delete()
+                .eq("color_id", col["id"])
+            )
+        await _execute_db_query(
+            supabase_admin.table("product_colors")
+            .delete()
+            .eq("product_id", product_id)
+        )
 
         for index, color_item in enumerate(colors_data):
             color_name = color_item.get("color_name")
@@ -2569,7 +2597,9 @@ async def update_product(
             if color_item.get("color_code"):
                 color_insert_data["color_code"] = color_item.get("color_code")
 
-            color_res = supabase_admin.table("product_colors").insert(color_insert_data).execute()
+            color_res = await _execute_db_query(
+                supabase_admin.table("product_colors").insert(color_insert_data)
+            )
 
             if color_res.data:
                 color_id = color_res.data[0]["id"]
@@ -2585,11 +2615,13 @@ async def update_product(
 
                     qty = int(variant.get("stock_qty", 0))
 
-                    supabase_admin.table("product_variants").insert({
-                        "color_id": color_id,
-                        "size_label": size_label,
-                        "stock_qty": qty
-                    }).execute()
+                    await _execute_db_query(
+                        supabase_admin.table("product_variants").insert({
+                            "color_id": color_id,
+                            "size_label": size_label,
+                            "stock_qty": qty
+                        })
+                    )
 
                 # رفع صور الألوان الجديدة ودمج QR الموديل الحالي باستخدام الفهرس المطابق
                 color_images = form.getlist(f"color_images_{index}")
@@ -2600,17 +2632,22 @@ async def update_product(
                         file_name = f"col_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
                         file_path = f"products/{product_id}/colors/{color_id}/{file_name}"
 
-                        supabase_admin.storage.from_("product-images").upload(
-                            file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                        await run_in_threadpool(
+                            supabase_admin.storage.from_("product-images").upload,
+                            file_path,
+                            processed_bytes,
+                            file_options={"content-type": "image/jpeg"},
                         )
                         public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
 
-                        supabase_admin.table("product_images").insert({
-                            "product_id": product_id,
-                            "color_id": color_id,
-                            "image_url": public_url,
-                            "image_type": "color"
-                        }).execute()
+                        await _execute_db_query(
+                            supabase_admin.table("product_images").insert({
+                                "product_id": product_id,
+                                "color_id": color_id,
+                                "image_url": public_url,
+                                "image_type": "color"
+                            })
+                        )
 
         # 8. رفع الصور العامة الجديدة ودمج QR الموديل الحالي
         general_images = form.getlist("general_images")
@@ -2621,16 +2658,21 @@ async def update_product(
                 file_name = f"gen_{os.urandom(4).hex()}_{os.path.basename(img.filename)}"
                 file_path = f"products/{product_id}/general/{file_name}"
 
-                supabase_admin.storage.from_("product-images").upload(
-                    file_path, processed_bytes, file_options={"content-type": "image/jpeg"}
+                await run_in_threadpool(
+                    supabase_admin.storage.from_("product-images").upload,
+                    file_path,
+                    processed_bytes,
+                    file_options={"content-type": "image/jpeg"},
                 )
                 public_url = supabase_admin.storage.from_("product-images").get_public_url(file_path)
 
-                supabase_admin.table("product_images").insert({
-                    "product_id": product_id,
-                    "image_url": public_url,
-                    "image_type": "general"
-                }).execute()
+                await _execute_db_query(
+                    supabase_admin.table("product_images").insert({
+                        "product_id": product_id,
+                        "image_url": public_url,
+                        "image_type": "general"
+                    })
+                )
 
         return {
             "status": "success",
@@ -2663,7 +2705,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # دالة لجلب أو تسجيل حصة التاجر في قاعدة البيانات المركزية المنفصلة
-async def _get_or_create_central_quota(merchant_id: str):
+def _get_or_create_central_quota(merchant_id: str):
     if not central_supabase:
         raise HTTPException(
             status_code=500, 
@@ -2700,6 +2742,17 @@ async def _get_or_create_central_quota(merchant_id: str):
 
 
 # ==================== مسار تحليل الكرتون بـ Vision AI والتحقق من الحصة ====================
+def _validate_and_encode_scan_image(image_bytes: bytes):
+    with Image.open(io.BytesIO(image_bytes)) as uploaded_image:
+        image_format = uploaded_image.format
+        uploaded_image.verify()
+
+    image_mime_type = Image.MIME.get(image_format)
+    if not image_mime_type or not image_mime_type.startswith("image/"):
+        return image_mime_type, None
+    return image_mime_type, base64.b64encode(image_bytes).decode("ascii")
+
+
 @app.post("/api/scan-carton", dependencies=[Depends(get_current_user_id)])
 async def scan_carton_with_ai(
     file: UploadFile = File(...),
@@ -2718,7 +2771,10 @@ async def scan_carton_with_ai(
     started_at = perf_counter()
     try:
         # 1. التحقق من حصة التاجر في القاعدة المركزية المنفصلة
-        images_used, allowed_limit, is_subscribed = await _get_or_create_central_quota(merchant_id)
+        images_used, allowed_limit, is_subscribed = await run_in_threadpool(
+            _get_or_create_central_quota,
+            merchant_id,
+        )
         print(f"Carton scan quota check: {perf_counter() - started_at:.2f}s")
 
         if images_used >= allowed_limit:
@@ -2732,13 +2788,18 @@ async def scan_carton_with_ai(
                 }
             )
 
-        # 2. قراءة الصورة المرسلة من التطبيق
-        image_bytes = await file.read()
+        image_bytes = await file.read(MAX_SCAN_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_SCAN_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="حجم الصورة يتجاوز الحد المسموح (10 ميغابايت).",
+            )
+
         try:
-            with Image.open(io.BytesIO(image_bytes)) as uploaded_image:
-                image_format = uploaded_image.format
-                uploaded_image.verify()
-            image_mime_type = Image.MIME.get(image_format)
+            image_mime_type, image_base64 = await run_in_threadpool(
+                _validate_and_encode_scan_image,
+                image_bytes,
+            )
         except (OSError, ValueError):
             raise HTTPException(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
@@ -2752,7 +2813,6 @@ async def scan_carton_with_ai(
             )
 
         # 3. تحليل الصورة عبر OpenAI Responses API
-        image_base64 = base64.b64encode(image_bytes).decode("ascii")
         image_data_url = f"data:{image_mime_type};base64,{image_base64}"
         model_started_at = perf_counter()
         response = await openai_client.responses.create(
@@ -2842,10 +2902,14 @@ async def scan_carton_with_ai(
 
         # 4. تحديث العداد في القاعدة المركزية بزيادة 1
         new_used_count = images_used + 1
-        central_supabase.table("merchant_quotas").update({
-            "images_used": new_used_count,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }).eq("merchant_id", merchant_id).execute()
+        await _execute_db_query(
+            central_supabase.table("merchant_quotas")
+            .update({
+                "images_used": new_used_count,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("merchant_id", merchant_id)
+        )
 
         return {
             "status": "success",
