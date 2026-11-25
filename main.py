@@ -1967,6 +1967,35 @@ def get_order_details(
             .eq("order_id", order_id)
             .execute()
         )
+        items = items_res.data or []
+        product_ids = list({
+            item["product_id"]
+            for item in items
+            if item.get("product_id") is not None
+        })
+        images_by_product = {}
+        if product_ids:
+            images_res = (
+                supabase_admin.table("product_images")
+                .select("product_id, image_url, image_type")
+                .in_("product_id", product_ids)
+                .execute()
+            )
+            for image in images_res.data or []:
+                product_id = str(image["product_id"])
+                if (
+                    product_id not in images_by_product
+                    or image.get("image_type") == "general"
+                ):
+                    images_by_product[product_id] = image.get("image_url")
+        for item in items:
+            product_id = item.get("product_id")
+            item["image_url"] = (
+                images_by_product.get(str(product_id))
+                if product_id is not None
+                else None
+            )
+
         logs_res = (
             supabase_admin.table("order_logs")
             .select("*")
@@ -1977,7 +2006,7 @@ def get_order_details(
 
         return {
             "order": order_data,
-            "items": items_res.data or [],
+            "items": items,
             "logs": logs_res.data or [],
         }
         
