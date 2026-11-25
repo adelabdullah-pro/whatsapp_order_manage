@@ -1885,6 +1885,68 @@ class OrderStatusUpdate(BaseModel):
     cancellation_reason: Optional[str] = None
     notes: Optional[str] = None
 
+
+class CustomerBasketSlotUpdate(BaseModel):
+    basket_key: str
+    slot_number: Optional[str] = None
+
+
+def _validate_customer_basket_key(basket_key: str) -> str:
+    normalized_key = basket_key.strip()
+    if not normalized_key or len(normalized_key) > 200:
+        raise HTTPException(status_code=422, detail="معرّف سلة الزبون غير صالح")
+    return normalized_key
+
+
+@app.get("/api/customer-baskets/slot")
+def get_customer_basket_slot(
+    basket_key: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    normalized_key = _validate_customer_basket_key(basket_key)
+    try:
+        result = (
+            supabase_admin.table("customer_basket_slots")
+            .select("slot_number")
+            .eq("owner_id", user_id)
+            .eq("basket_key", normalized_key)
+            .limit(1)
+            .execute()
+        )
+        slot_number = result.data[0].get("slot_number") if result.data else None
+        return {"status": "success", "slot_number": slot_number}
+    except Exception as error:
+        print("❌ Error fetching customer basket slot:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر جلب رقم خانة السلة")
+
+
+@app.put("/api/customer-baskets/slot")
+def update_customer_basket_slot(
+    data: CustomerBasketSlotUpdate,
+    user_id: str = Depends(get_current_user_id),
+):
+    normalized_key = _validate_customer_basket_key(data.basket_key)
+    slot_number = data.slot_number.strip() if data.slot_number else ""
+    if len(slot_number) > 50:
+        raise HTTPException(status_code=422, detail="رقم الخانة يجب ألا يتجاوز 50 حرفاً")
+
+    slot_number = slot_number or None
+    try:
+        supabase_admin.table("customer_basket_slots").upsert(
+            {
+                "owner_id": user_id,
+                "basket_key": normalized_key,
+                "slot_number": slot_number,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="owner_id,basket_key",
+        ).execute()
+        return {"status": "success", "slot_number": slot_number}
+    except Exception as error:
+        print("❌ Error saving customer basket slot:", repr(error))
+        raise HTTPException(status_code=500, detail="تعذر حفظ رقم خانة السلة")
+
+
 # 1. جلب قائمة الطلبات مع إمكانية التصفية والبحث
 @app.get("/api/orders")
 def get_orders(
