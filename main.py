@@ -286,6 +286,17 @@ def get_products(user_id: str = Depends(get_current_user_id)):
         )
 
 # ==================== حفظ المنتج مع الصور والألوان ====================
+def _parse_boolean_form_value(value, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail="قيمة إعداد خصم المخزون غير صالحة")
+
+
 @app.post("/api/products/with-images")
 async def add_product_with_images(
     request: Request,
@@ -308,6 +319,10 @@ async def add_product_with_images(
         product_status = form.get("status", "draft")
         description = form.get("description")
         colors_json = form.get("colors_json", "[]")
+        manual_stock_deduction = _parse_boolean_form_value(
+            form.get("manual_stock_deduction"),
+            default=False,
+        )
 
         colors_data = json.loads(colors_json)
         qr_code_value = f"BAR-{model_number.upper()}"
@@ -320,6 +335,7 @@ async def add_product_with_images(
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
             "status": product_status,
+            "manual_stock_deduction": manual_stock_deduction,
         }
 
         prod_res = await _execute_db_query(
@@ -1188,21 +1204,24 @@ def save_whatsapp_order(sender_phone: str, session: dict):
         "unit_price": order_total,
         "quantity": 1,
         "line_total": order_total,
+        "manual_stock_deduction": session.get("manual_stock_deduction") is True,
+        "inventory_deducted": session.get("manual_stock_deduction") is not True,
     }
     try:
         supabase_admin.table("order_items").insert(item_payload).execute()
-        stock_res = (
-            supabase_admin.table("product_variants")
-            .update({"stock_qty": current_stock - 1})
-            .eq("id", variant_id)
-            .eq("stock_qty", current_stock)
-            .select("id")
-            .execute()
-        )
-        if not stock_res.data:
-            supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
-            supabase_admin.table("orders").delete().eq("id", order_id).execute()
-            return None
+        if not session.get("manual_stock_deduction", False):
+            stock_res = (
+                supabase_admin.table("product_variants")
+                .update({"stock_qty": current_stock - 1})
+                .eq("id", variant_id)
+                .eq("stock_qty", current_stock)
+                .select("id")
+                .execute()
+            )
+            if not stock_res.data:
+                supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
+                supabase_admin.table("orders").delete().eq("id", order_id).execute()
+                return None
     except Exception:
         supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
         supabase_admin.table("orders").delete().eq("id", order_id).execute()
@@ -1615,7 +1634,7 @@ async def receive_whatsapp_message(request: Request):
 
                         product_res = await _execute_db_query(
                             supabase_admin.table("products")
-                            .select("id, owner_id, model_number, name, retail_price, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
+                            .select("id, owner_id, model_number, name, retail_price, manual_stock_deduction, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
                             .ilike("model_number", model_number)
                             .limit(1)
                         )
@@ -1676,6 +1695,10 @@ async def receive_whatsapp_message(request: Request):
                             "product_name": product["name"],
                             "model_number": product["model_number"],
                             "retail_price": product["retail_price"],
+                            "manual_stock_deduction": product.get(
+                                "manual_stock_deduction",
+                                False,
+                            ),
                             "variant_id": variant["id"],
                             "color_name": color["color_name"],
                             "size_label": (
@@ -2052,6 +2075,11 @@ def update_order_status(
         raise
     except Exception as e:
         print("❌ Error updating order status:", repr(e))
+        if "INSUFFICIENT_INVENTORY" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="المخزون غير كافٍ لتأكيد هذا الطلب. حدّث الكمية ثم أعد المحاولة.",
+            )
         raise HTTPException(status_code=500, detail=f"خطأ في تحديث حالة الطلب: {str(e)}")
 
 class OrderPaymentUpdate(BaseModel):
@@ -2482,7 +2510,7 @@ async def update_product(
         # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
         current_prod_res = await _execute_db_query(
             supabase_admin.table("products")
-            .select("model_number, owner_id")
+            .select("model_number, owner_id, manual_stock_deduction")
             .eq("id", product_id)
             .eq("owner_id", user_id)
         )
@@ -2491,6 +2519,10 @@ async def update_product(
             raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
 
         old_model_number = current_prod_res.data[0]["model_number"]
+        manual_stock_deduction = _parse_boolean_form_value(
+            form.get("manual_stock_deduction"),
+            default=current_prod_res.data[0].get("manual_stock_deduction", False),
+        )
 
         # 3. التحقق من أن رقم الموديل الجديد غير مستخدم لمنتج آخر لنفس التاجر
         if model_number != old_model_number:
@@ -2545,6 +2577,7 @@ async def update_product(
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
             "status": product_status,
+            "manual_stock_deduction": manual_stock_deduction,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
