@@ -301,6 +301,24 @@ def _parse_boolean_form_value(value, default: bool) -> bool:
     raise HTTPException(status_code=400, detail="قيمة إعداد خصم المخزون غير صالحة")
 
 
+def _parse_optional_weight(value: Any) -> Optional[float]:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        weight_kg = float(value)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail="الوزن يجب أن يكون رقماً موجباً بالكيلوغرام أو يُترك فارغاً",
+        ) from error
+    if not math.isfinite(weight_kg) or weight_kg <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="الوزن يجب أن يكون أكبر من صفر بالكيلوغرام أو يُترك فارغاً",
+        )
+    return weight_kg
+
+
 @app.post("/api/products/with-images")
 async def add_product_with_images(
     request: Request,
@@ -309,9 +327,24 @@ async def add_product_with_images(
     try:
         form = await request.form()
 
-        model_number = form.get("model_number")
-        name = form.get("name")
-        retail_price = float(form.get("retail_price"))
+        model_number = str(form.get("model_number") or "").strip()
+        name = str(form.get("name") or "").strip()
+        if not model_number:
+            raise HTTPException(status_code=400, detail="رقم الموديل مطلوب")
+        if not name:
+            raise HTTPException(status_code=400, detail="اسم المنتج مطلوب")
+        try:
+            retail_price = float(form.get("retail_price"))
+        except (TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=400,
+                detail="سعر التجزئة يجب أن يكون رقماً غير سالب",
+            ) from error
+        if not math.isfinite(retail_price) or retail_price < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="سعر التجزئة يجب أن يكون رقماً غير سالب",
+            )
 
         wholesale_price = (
             float(form.get("wholesale_price"))
@@ -319,6 +352,7 @@ async def add_product_with_images(
             and form.get("wholesale_price") != "null"
             else None
         )
+        weight_kg = _parse_optional_weight(form.get("weight_kg"))
 
         product_status = form.get("status", "draft")
         description = form.get("description")
@@ -338,6 +372,7 @@ async def add_product_with_images(
             "description": description,
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
+            "weight_kg": weight_kg,
             "status": product_status,
             "manual_stock_deduction": manual_stock_deduction,
         }
@@ -2637,6 +2672,7 @@ async def update_product(
         name = form.get("name")
         retail_price_str = form.get("retail_price")
         wholesale_price_str = form.get("wholesale_price")
+        weight_kg_form_value = form.get("weight_kg")
         product_status = form.get("status", "draft")
         description = form.get("description")
         colors_json = form.get("colors_json", "[]")
@@ -2662,7 +2698,7 @@ async def update_product(
         # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
         current_prod_res = await _execute_db_query(
             supabase_admin.table("products")
-            .select("model_number, owner_id, manual_stock_deduction")
+            .select("model_number, owner_id, manual_stock_deduction, weight_kg")
             .eq("id", product_id)
             .eq("owner_id", user_id)
         )
@@ -2671,6 +2707,11 @@ async def update_product(
             raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
 
         old_model_number = current_prod_res.data[0]["model_number"]
+        weight_kg = (
+            current_prod_res.data[0].get("weight_kg")
+            if weight_kg_form_value is None
+            else _parse_optional_weight(weight_kg_form_value)
+        )
         manual_stock_deduction = _parse_boolean_form_value(
             form.get("manual_stock_deduction"),
             default=current_prod_res.data[0].get("manual_stock_deduction", False),
@@ -2728,6 +2769,7 @@ async def update_product(
             "description": description,
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
+            "weight_kg": weight_kg,
             "status": product_status,
             "manual_stock_deduction": manual_stock_deduction,
             "updated_at": datetime.now(timezone.utc).isoformat()
