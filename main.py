@@ -6,6 +6,8 @@ import hmac
 import io
 import re
 import unicodedata
+import math
+from urllib.parse import urlparse
 from bidi.algorithm import get_display
 from typing import Optional, List, Any
 from fastapi import (
@@ -51,6 +53,8 @@ USER_SESSIONS = {}
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_MANAGEMENT_API_TOKEN = os.getenv("SUPABASE_MANAGEMENT_API_TOKEN")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF")
 
 # التحقق من متغيرات البيئة قبل إنشاء الاتصالات
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -2394,6 +2398,92 @@ async def get_whatsapp_settings(user_id: str = Depends(get_current_user_id)):
 
 
 # =============================نموذج التقارير =============================
+
+@app.get("/api/database/storage")
+async def get_database_storage(
+    user_id: str = Depends(get_current_user_id),
+):
+    if not SUPABASE_MANAGEMENT_API_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="مراقبة مساحة Supabase غير مهيأة على الخادم",
+        )
+
+    project_ref = SUPABASE_PROJECT_REF
+    if not project_ref:
+        hostname = urlparse(SUPABASE_URL).hostname
+        if not hostname or not hostname.endswith(".supabase.co"):
+            raise HTTPException(
+                status_code=503,
+                detail="تعذر تحديد مشروع Supabase لمراقبة المساحة",
+            )
+        project_ref = hostname.split(".", 1)[0]
+    if not re.fullmatch(r"[a-z0-9-]+", project_ref):
+        raise HTTPException(
+            status_code=503,
+            detail="تعذر تحديد مشروع Supabase لمراقبة المساحة",
+        )
+
+    url = f"https://api.supabase.com/v1/projects/{project_ref}/config/disk/util"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_MANAGEMENT_API_TOKEN}",
+                },
+            )
+            response.raise_for_status()
+            metrics = response.json().get("metrics")
+
+        if not isinstance(metrics, dict):
+            raise ValueError("Invalid Supabase disk utilization response")
+
+        def read_bytes(field: str) -> int:
+            value = metrics.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
+                or value < 0
+            ):
+                raise ValueError(f"Invalid {field} in Supabase response")
+            return int(value)
+
+        total_bytes = read_bytes("fs_size_bytes")
+        if total_bytes <= 0:
+            raise ValueError("Invalid disk size in Supabase response")
+
+        return {
+            "status": "success",
+            "data": {
+                "used_bytes": read_bytes("fs_used_bytes"),
+                "available_bytes": read_bytes("fs_avail_bytes"),
+                "total_bytes": total_bytes,
+            },
+        }
+    except httpx.HTTPStatusError as error:
+        print(
+            "❌ Supabase disk utilization request failed:",
+            error.response.status_code,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="تعذر جلب مساحة قاعدة البيانات من Supabase",
+        ) from error
+    except httpx.RequestError as error:
+        print("❌ Supabase disk utilization request failed:", repr(error))
+        raise HTTPException(
+            status_code=502,
+            detail="تعذر الاتصال بخدمة Supabase لمراقبة المساحة",
+        ) from error
+    except (ValueError, TypeError, AttributeError) as error:
+        print("❌ Invalid Supabase disk utilization response:", repr(error))
+        raise HTTPException(
+            status_code=502,
+            detail="استجابة مساحة قاعدة البيانات من Supabase غير صالحة",
+        ) from error
+
 
 @app.get("/api/dashboard")
 def get_dashboard(
