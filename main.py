@@ -110,10 +110,15 @@ class LoginSchema(BaseModel):
     password: str
 
 
+class RefreshSessionSchema(BaseModel):
+    refresh_token: str
+
+
 # ==================== مسارات المصادقة ====================
 
 @app.post("/api/login")
-async def login(credentials: LoginSchema):
+async def login(credentials: LoginSchema, http_response: Response):
+    http_response.headers["Cache-Control"] = "no-store"
     try:
         response = supabase.auth.sign_in_with_password({
             "email": credentials.email,
@@ -130,6 +135,7 @@ async def login(credentials: LoginSchema):
             "status": "success",
             "message": "تم تسجيل الدخول بنجاح",
             "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
             "user": {
                 "id": response.user.id,
                 "email": response.user.email
@@ -144,6 +150,46 @@ async def login(credentials: LoginSchema):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="فشل تسجيل الدخول، تحقق من البريد الإلكتروني وكلمة المرور"
         )
+
+
+@app.post("/api/auth/refresh")
+async def refresh_session(credentials: RefreshSessionSchema, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    if not credentials.refresh_token.strip():
+        raise HTTPException(status_code=401, detail="انتهت الجلسة، سجل الدخول مجدداً")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            auth_response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/auth/v1/token",
+                params={"grant_type": "refresh_token"},
+                headers={"apikey": SUPABASE_KEY},
+                json={"refresh_token": credentials.refresh_token},
+            )
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=503, detail="تعذر تجديد الجلسة، حاول مجدداً"
+        ) from error
+
+    if auth_response.status_code in (400, 401):
+        raise HTTPException(status_code=401, detail="انتهت الجلسة، سجل الدخول مجدداً")
+    if auth_response.status_code != 200:
+        raise HTTPException(status_code=503, detail="تعذر تجديد الجلسة، حاول مجدداً")
+    try:
+        data = auth_response.json()
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="استجابة المصادقة غير صالحة") from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("access_token"), str)
+        or not data["access_token"]
+        or not isinstance(data.get("refresh_token"), str)
+        or not data["refresh_token"]
+    ):
+        raise HTTPException(status_code=502, detail="استجابة المصادقة غير صالحة")
+    return {
+        "access_token": data["access_token"],
+        "refresh_token": data["refresh_token"],
+    }
 
 
 @app.post("/api/register")
@@ -223,37 +269,127 @@ async def auth_me(
     }
 
 
+class MerchantIdentitySchema(BaseModel):
+    merchant_name: str
+
+
+def _merchant_identity(user_id: str) -> Optional[str]:
+    result = (
+        supabase_admin.table("merchant_identities")
+        .select("merchant_name")
+        .eq("owner_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0]["merchant_name"] if result.data else None
+
+
+@app.get("/api/merchant-identity")
+def get_merchant_identity(user_id: str = Depends(get_current_user_id)):
+    return {"merchant_name": _merchant_identity(user_id)}
+
+
+@app.post("/api/merchant-identity")
+def create_merchant_identity(
+    identity: MerchantIdentitySchema,
+    user_id: str = Depends(get_current_user_id),
+):
+    name = identity.merchant_name.strip()
+    if not name or len(name) > 100:
+        raise HTTPException(status_code=400, detail="أدخل اسم تاجر من 1 إلى 100 حرف")
+    try:
+        supabase_admin.table("merchant_identities").insert({
+            "owner_id": user_id,
+            "merchant_name": name,
+        }).execute()
+    except Exception as error:
+        if str(getattr(error, "code", "")) != "23505":
+            raise
+        existing = _merchant_identity(user_id)
+        if existing != name:
+            raise HTTPException(
+                status_code=409, detail="اسم التاجر محفوظ ولا يمكن تغييره"
+            ) from error
+    return {"merchant_name": name}
+
+
+def _product_qr_value(merchant_name: str, model_number: str) -> str:
+    return json.dumps([merchant_name, model_number], ensure_ascii=False, separators=(",", ":"))
+
+
+async def _find_product_from_qr(qr_value: str, columns: str) -> Optional[dict]:
+    value = qr_value.strip()
+    merchant_name = None
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if (
+            not isinstance(parsed, list)
+            or len(parsed) != 2
+            or not all(isinstance(part, str) and part for part in parsed)
+        ):
+            return None
+        merchant_name, model_number = parsed
+    else:
+        model_number = value[4:].strip() if value.upper().startswith("BAR-") else value
+    if not model_number:
+        return None
+
+    query = supabase_admin.table("products").select(columns)
+    query = (
+        query.eq("model_number", model_number)
+        if merchant_name is not None
+        else query.ilike("model_number", model_number)
+    )
+    result = await _execute_db_query(query.limit(1))
+    if not result.data:
+        return None
+    product = result.data[0]
+    if merchant_name is not None:
+        actual_name = await run_in_threadpool(_merchant_identity, product["owner_id"])
+        if actual_name != merchant_name:
+            return None
+    return product
+
+
 # ==================== دالة توليد ودمج الباركود على الصورة ====================
 
+def _qr_image(qr_data: str) -> Image.Image:
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=3,
+        border=4,
+    )
+    qr.add_data(qr_data)
+    try:
+        qr.make(fit=True)
+    except qrcode.exceptions.DataOverflowError as error:
+        raise HTTPException(
+            status_code=400, detail="اسم التاجر ورقم الموديل طويلان جداً للباركود"
+        ) from error
+    return qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+
+
+def _check_qr_image_size(image_bytes: bytes, qr_data: str) -> None:
+    qr_img = _qr_image(qr_data)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        if image.width < qr_img.width + 30 or image.height < qr_img.height + 30:
+            raise HTTPException(
+                status_code=400,
+                detail="الصورة صغيرة جداً لباركود اسم التاجر والموديل، اختر صورة أكبر",
+            )
+
+
 def _apply_qr_overlay_sync(image_bytes: bytes, qr_data: str) -> bytes:
+    _check_qr_image_size(image_bytes, qr_data)
     base_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     base_w, base_h = base_image.size
-
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=2,
-    )
-
-    qr.add_data(qr_data)
-    qr.make(fit=True)
-
-    qr_img = qr.make_image(
-        fill_color="black",
-        back_color="white"
-    ).convert("RGBA")
-
-    qr_img = qr_img.resize((100, 100))
-
+    qr_img = _qr_image(qr_data)
     margin = 15
-    position_x = base_w - 100 - margin
-    position_y = base_h - 100 - margin
-
-    if position_x < 0 or position_y < 0:
-        qr_img = qr_img.resize((50, 50))
-        position_x = base_w - 50 - margin
-        position_y = base_h - 50 - margin
+    position_x = base_w - qr_img.width - margin
+    position_y = base_h - qr_img.height - margin
 
     base_image.paste(qr_img, (position_x, position_y), qr_img)
 
@@ -273,6 +409,17 @@ def _apply_qr_overlay_sync(image_bytes: bytes, qr_data: str) -> bytes:
 
 async def apply_qr_overlay(image_bytes: bytes, qr_data: str) -> bytes:
     return await run_in_threadpool(_apply_qr_overlay_sync, image_bytes, qr_data)
+
+
+async def _check_uploaded_qr_images(form: Any, color_count: int, qr_data: str) -> None:
+    images = list(form.getlist("general_images"))
+    for index in range(color_count):
+        images.extend(form.getlist(f"color_images_{index}"))
+    for image in images:
+        if hasattr(image, "filename") and image.filename:
+            content = await image.read()
+            await run_in_threadpool(_check_qr_image_size, content, qr_data)
+            await image.seek(0)
 
 
 # ==================== جلب المنتجات ====================
@@ -376,6 +523,9 @@ async def add_product_with_images(
             raise HTTPException(status_code=400, detail="رقم الموديل مطلوب")
         if not name:
             raise HTTPException(status_code=400, detail="اسم المنتج مطلوب")
+        merchant_name = await run_in_threadpool(_merchant_identity, user_id)
+        if not merchant_name:
+            raise HTTPException(status_code=400, detail="احفظ اسم التاجر في الإعدادات أولاً")
         try:
             retail_price = float(form.get("retail_price"))
         except (TypeError, ValueError) as error:
@@ -414,7 +564,8 @@ async def add_product_with_images(
         )
 
         colors_data = json.loads(colors_json)
-        qr_code_value = f"BAR-{model_number.upper()}"
+        qr_code_value = _product_qr_value(merchant_name, model_number)
+        await _check_uploaded_qr_images(form, len(colors_data), qr_code_value)
 
         prod_data = {
             "owner_id": user_id,
@@ -749,20 +900,14 @@ async def _legacy_receive_whatsapp_message(request: Request):
                         await send_whatsapp_message(sender_phone, reply_text)
                         continue
 
-                    model_number = barcode_value.replace("BAR-", "").strip()
-
-                    # فحص المنتج وجلب بياناته من قاعدة البيانات
-                    db_res = await _execute_db_query(
-                        supabase_admin.table("products")
-                        .select("*, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
-                        .ilike("model_number", model_number)
+                    product = await _find_product_from_qr(
+                        barcode_value,
+                        "*, product_colors(id, color_name, product_variants(id, size_label, stock_qty))",
                     )
 
-                    if not db_res.data or len(db_res.data) == 0:
+                    if not product:
                         await send_whatsapp_message(sender_phone, f"❌ الباركود ({barcode_value}) غير مسجل في نظامنا.")
                         continue
-
-                    product = db_res.data[0]
 
                     # التحقق من اسم العميل المسبق في قاعدة البيانات
                     existing_customer_res = await _execute_db_query(
@@ -801,7 +946,7 @@ async def _legacy_receive_whatsapp_message(request: Request):
                     session_data = {
                         "product_id": product["id"],
                         "product_name": product["name"],
-                        "model_number": model_number,
+                        "model_number": product["model_number"],
                         "retail_price": product["retail_price"],
                         "colors_data": valid_colors
                     }
@@ -1713,21 +1858,14 @@ async def receive_whatsapp_message(request: Request):
                             )
                             continue
 
-                        model_number = barcode_value.strip()
-                        if model_number.upper().startswith("BAR-"):
-                            model_number = model_number[4:].strip()
-
-                        product_res = await _execute_db_query(
-                            supabase_admin.table("products")
-                            .select("id, owner_id, model_number, name, retail_price, manual_stock_deduction, product_colors(id, color_name, product_variants(id, size_label, stock_qty))")
-                            .ilike("model_number", model_number)
-                            .limit(1)
+                        product = await _find_product_from_qr(
+                            barcode_value,
+                            "id, owner_id, model_number, name, retail_price, manual_stock_deduction, product_colors(id, color_name, product_variants(id, size_label, stock_qty))",
                         )
-                        if not product_res.data:
+                        if not product:
                             await send_whatsapp_message(sender_phone, "المنتج غير مسجل لدينا. أرسل صورة منتج آخر.")
                             continue
 
-                        product = product_res.data[0]
                         caption = image.get("caption", "")
                         color, variant, missing = find_requested_variant(
                             caption, product.get("product_colors", [])
@@ -2759,6 +2897,10 @@ async def update_product(
         if not current_prod_res.data:
             raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
 
+        merchant_name = await run_in_threadpool(_merchant_identity, user_id)
+        if not merchant_name:
+            raise HTTPException(status_code=400, detail="احفظ اسم التاجر في الإعدادات أولاً")
+
         old_model_number = current_prod_res.data[0]["model_number"]
         current_product = current_prod_res.data[0]
         if has_weight_range:
@@ -2800,6 +2942,8 @@ async def update_product(
 
         colors_data = json.loads(colors_json)
         deleted_image_ids = json.loads(deleted_image_ids_json)
+        qr_code_value = _product_qr_value(merchant_name, model_number)
+        await _check_uploaded_qr_images(form, len(colors_data), qr_code_value)
 
         # 4. التحقق من عدم حذف أي لون أو مقاس مرتبط بمبيعات أو فواتير سابقة
         sold_items_res = await _execute_db_query(
@@ -2831,6 +2975,29 @@ async def update_product(
                     detail=f"لا يمكن حذف اللون ({sold_color}) والمقاس ({sold_size}) لارتباطه بفواتير ومبيعات سابقة. يمكنك تصفير كميته (0) بدلاً من حذفه."
                 )
 
+        prepared_images = []
+        if model_number != old_model_number:
+            existing_imgs = await _execute_db_query(
+                supabase_admin.table("product_images")
+                .select("*")
+                .eq("product_id", product_id)
+            )
+            deleted_ids = {str(image_id) for image_id in deleted_image_ids}
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                for img_rec in (existing_imgs.data or []):
+                    if str(img_rec["id"]) in deleted_ids:
+                        continue
+                    try:
+                        response = await client.get(img_rec["image_url"])
+                        response.raise_for_status()
+                        processed = await apply_qr_overlay(response.content, qr_code_value)
+                    except httpx.HTTPError as error:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="تعذر تحميل صور المنتج لتحديث الباركود، حاول مجدداً",
+                        ) from error
+                    prepared_images.append((img_rec["id"], processed))
+
         # 5. تحديث البيانات الأساسية (مع بقاء product_id ثابتاً)
         prod_data = {
             "model_number": model_number,
@@ -2855,8 +3022,6 @@ async def update_product(
         if not update_res.data:
             raise HTTPException(status_code=500, detail="فشل تحديث بيانات المنتج الأساسية")
 
-        qr_code_value = f"BAR-{model_number.upper()}"
-
         # 6. إدارة الصور القديمة (حذف الصور التي أزالها المستخدم + إعادة ختم الصور المتبقية إذا تغير الموديل)
         if deleted_image_ids:
             await _execute_db_query(
@@ -2866,33 +3031,20 @@ async def update_product(
                 .eq("product_id", product_id)
             )
 
-        if model_number != old_model_number:
-            existing_imgs = await _execute_db_query(
-                supabase_admin.table("product_images")
-                .select("*")
-                .eq("product_id", product_id)
+        for image_id, new_bytes in prepared_images:
+            new_path = f"products/{product_id}/updated_{os.urandom(4).hex()}.jpg"
+            await run_in_threadpool(
+                supabase_admin.storage.from_("product-images").upload,
+                new_path,
+                new_bytes,
+                file_options={"content-type": "image/jpeg"},
             )
-            async with httpx.AsyncClient() as client:
-                for img_rec in (existing_imgs.data or []):
-                    try:
-                        res_img = await client.get(img_rec["image_url"])
-                        if res_img.status_code == 200:
-                            new_bytes = await apply_qr_overlay(res_img.content, qr_code_value)
-                            new_path = f"products/{product_id}/updated_{os.urandom(4).hex()}.jpg"
-                            await run_in_threadpool(
-                                supabase_admin.storage.from_("product-images").upload,
-                                new_path,
-                                new_bytes,
-                                file_options={"content-type": "image/jpeg"},
-                            )
-                            new_url = supabase_admin.storage.from_("product-images").get_public_url(new_path)
-                            await _execute_db_query(
-                                supabase_admin.table("product_images")
-                                .update({"image_url": new_url})
-                                .eq("id", img_rec["id"])
-                            )
-                    except Exception as img_err:
-                        print("⚠️ تحذير أثناء تحديث باركود صورة قديمة:", repr(img_err))
+            new_url = supabase_admin.storage.from_("product-images").get_public_url(new_path)
+            await _execute_db_query(
+                supabase_admin.table("product_images")
+                .update({"image_url": new_url})
+                .eq("id", image_id)
+            )
 
         # 7. تحديث الألوان والمقاسات والكميات بأمان بعد اجتياز فحص المبيعات التاريخية
         old_colors_res = await _execute_db_query(
