@@ -24,7 +24,7 @@ from fastapi import (
 )
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, EmailStr
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 import qrcode
 from PIL import Image
@@ -74,9 +74,16 @@ supabase: Client = create_client(
 )
 
 # اتصال الإدارة للعمليات الخلفية
+_supabase_admin_http_client = httpx.Client(
+    http1=True,
+    http2=False,
+    follow_redirects=True,
+    timeout=120,
+)
 supabase_admin: Client = create_client(
     SUPABASE_URL,
-    SUPABASE_SERVICE_ROLE_KEY
+    SUPABASE_SERVICE_ROLE_KEY,
+    options=ClientOptions(httpx_client=_supabase_admin_http_client),
 )
 
 
@@ -91,6 +98,10 @@ META_APP_SECRET = os.getenv("META_APP_SECRET")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 MAX_SCAN_IMAGE_BYTES = 10 * 1024 * 1024
+_durable_queue_setting = os.getenv("WHATSAPP_DURABLE_QUEUE_ENABLED", "false").strip().lower()
+if _durable_queue_setting not in {"true", "false"}:
+    raise RuntimeError("WHATSAPP_DURABLE_QUEUE_ENABLED must be true or false")
+WHATSAPP_DURABLE_QUEUE_ENABLED = _durable_queue_setting == "true"
 
 
 # ==================== نماذج البيانات ====================
@@ -319,6 +330,38 @@ def _parse_optional_weight(value: Any) -> Optional[float]:
     return weight_kg
 
 
+def _parse_optional_weight_range(
+    minimum_value: Any,
+    maximum_value: Any,
+) -> tuple[Optional[float], Optional[float]]:
+    minimum = _parse_optional_weight(minimum_value)
+    maximum = _parse_optional_weight(maximum_value)
+    if (minimum is None) != (maximum is None):
+        raise HTTPException(
+            status_code=400,
+            detail="يجب إدخال حدّي الوزن معاً أو تركهما فارغين",
+        )
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise HTTPException(
+            status_code=400,
+            detail="الحد الأدنى للوزن لا يمكن أن يكون أكبر من الحد الأعلى",
+        )
+    return minimum, maximum
+
+
+def _is_duplicate_model_number_error(error: Exception) -> bool:
+    error_code = str(getattr(error, "code", ""))
+    error_text = " ".join(
+        str(getattr(error, attribute, ""))
+        for attribute in ("message", "details", "hint")
+    )
+    error_text = f"{error_text} {error!r}".lower()
+    return (
+        error_code == "23505"
+        and "products_model_number_unique" in error_text
+    )
+
+
 @app.post("/api/products/with-images")
 async def add_product_with_images(
     request: Request,
@@ -352,7 +395,15 @@ async def add_product_with_images(
             and form.get("wholesale_price") != "null"
             else None
         )
-        weight_kg = _parse_optional_weight(form.get("weight_kg"))
+        if "weight_kg_min" in form or "weight_kg_max" in form:
+            weight_kg_min, weight_kg_max = _parse_optional_weight_range(
+                form.get("weight_kg_min"),
+                form.get("weight_kg_max"),
+            )
+        else:
+            weight_kg = _parse_optional_weight(form.get("weight_kg"))
+            weight_kg_min = weight_kg
+            weight_kg_max = weight_kg
 
         product_status = form.get("status", "draft")
         description = form.get("description")
@@ -372,7 +423,13 @@ async def add_product_with_images(
             "description": description,
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
-            "weight_kg": weight_kg,
+            "weight_kg": (
+                weight_kg_min
+                if weight_kg_min == weight_kg_max
+                else None
+            ),
+            "weight_kg_min": weight_kg_min,
+            "weight_kg_max": weight_kg_max,
             "status": product_status,
             "manual_stock_deduction": manual_stock_deduction,
         }
@@ -522,6 +579,11 @@ async def add_product_with_images(
     except Exception as e:
         # 🔍 طباعة الخطأ البرمجي الحقيقي بالكامل في لوحة تحكم Render Logs
         print("🔥 DETAILED ADD PRODUCT ERROR:", repr(e))
+        if _is_duplicate_model_number_error(e):
+            raise HTTPException(
+                status_code=409,
+                detail="رقم الموديل مستخدم بالفعل، يرجى إدخال رقم آخر.",
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"خطأ أثناء حفظ المنتج: {str(e)}"
@@ -1197,75 +1259,18 @@ def find_requested_variant(caption: str, colors: list):
     return color, default_variants[0], None
 
 
-def save_whatsapp_order(sender_phone: str, session: dict):
-    variant_id = session["variant_id"]
-    variant_res = (
-        supabase_admin.table("product_variants")
-        .select("id, stock_qty")
-        .eq("id", variant_id)
-        .execute()
-    )
-    if not variant_res.data or (variant_res.data[0].get("stock_qty") or 0) < 1:
-        return None
-
-    variant = variant_res.data[0]
-    current_stock = variant.get("stock_qty", 0)
-    order_total = float(session["retail_price"])
-    customer_name = session["customer_name"]
-    order_payload = {
-        "owner_id": session["owner_id"],
-        "customer_name": customer_name,
-        "customer_phone": sender_phone,
-        "source": "whatsapp",
-        "status": "new",
-        "payment_status": "unpaid",
-        "subtotal": order_total,
-        "delivery_fee": 0.00,
-        "discount": 0.00,
-        "total": order_total,
-        "currency": "YER",
-        "shipping_address": "غير محدد - طلب عبر واتساب",
-        "customer_notes": "طلب واتساب؛ الكمية قطعة واحدة",
-    }
-
-    order_res = supabase_admin.table("orders").insert(order_payload).execute()
-    if not order_res.data:
-        raise RuntimeError("فشل إنشاء الطلب")
-    order_id = order_res.data[0]["id"]
-
-    item_payload = {
-        "order_id": order_id,
-        "product_id": session["product_id"],
-        "product_name": session["product_name"],
-        "model_number": session["model_number"],
-        "color_name": session["color_name"],
-        "size_label": session.get("size_label"),
-        "unit_price": order_total,
-        "quantity": 1,
-        "line_total": order_total,
-        "manual_stock_deduction": session.get("manual_stock_deduction") is True,
-        "inventory_deducted": session.get("manual_stock_deduction") is not True,
-    }
-    try:
-        supabase_admin.table("order_items").insert(item_payload).execute()
-        if not session.get("manual_stock_deduction", False):
-            stock_res = (
-                supabase_admin.table("product_variants")
-                .update({"stock_qty": current_stock - 1})
-                .eq("id", variant_id)
-                .eq("stock_qty", current_stock)
-                .select("id")
-                .execute()
-            )
-            if not stock_res.data:
-                supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
-                supabase_admin.table("orders").delete().eq("id", order_id).execute()
-                return None
-    except Exception:
-        supabase_admin.table("order_items").delete().eq("order_id", order_id).execute()
-        supabase_admin.table("orders").delete().eq("id", order_id).execute()
-        raise
-    return order_id
+def save_whatsapp_order(sender_phone: str, session: dict, message_id: str):
+    result = supabase_admin.rpc(
+        "create_whatsapp_order",
+        {
+            "p_message_id": message_id,
+            "p_sender_phone": sender_phone,
+            "p_session": session,
+        },
+    ).execute().data
+    if not isinstance(result, dict) or "order_id" not in result:
+        raise RuntimeError("Invalid WhatsApp order creation response")
+    return result["order_id"]
 
 
 class CustomerInvoiceRequest(BaseModel):
@@ -1459,7 +1464,7 @@ async def send_whatsapp_document(to_phone: str, document: bytes, filename: str, 
             files={"file": (filename, document, "application/pdf")},
         )
         if upload_response.status_code != 200:
-            print("❌ WhatsApp invoice upload failed:", upload_response.status_code, upload_response.text)
+            print("❌ WhatsApp invoice upload failed:", upload_response.status_code)
             return False
 
         media_id = upload_response.json().get("id")
@@ -1482,7 +1487,7 @@ async def send_whatsapp_document(to_phone: str, document: bytes, filename: str, 
             },
         )
         if send_response.status_code != 200:
-            print("❌ WhatsApp invoice delivery failed:", send_response.status_code, send_response.text)
+            print("❌ WhatsApp invoice delivery failed:", send_response.status_code)
             return False
     return True
 
@@ -1642,10 +1647,51 @@ def get_customer_invoice_pdf(
         raise HTTPException(status_code=500, detail="تعذر جلب الفاتورة")
 
 
+def _extract_webhook_messages(body: Any) -> list:
+    if not isinstance(body, dict) or not isinstance(body.get("entry", []), list):
+        raise ValueError("Invalid webhook payload")
+    messages = []
+    for entry in body.get("entry", []):
+        if not isinstance(entry, dict) or not isinstance(entry.get("changes", []), list):
+            raise ValueError("Invalid webhook entry")
+        for change in entry.get("changes", []):
+            if not isinstance(change, dict) or not isinstance(change.get("value", {}), dict):
+                raise ValueError("Invalid webhook change")
+            incoming = change.get("value", {}).get("messages", [])
+            if not isinstance(incoming, list):
+                raise ValueError("Invalid webhook messages")
+            for message in incoming:
+                if not isinstance(message, dict):
+                    raise ValueError("Invalid webhook message")
+                if not isinstance(message.get("id"), str) or not message["id"].strip():
+                    raise ValueError("Webhook message ID is missing")
+                if not isinstance(message.get("from"), str) or not message["from"].strip():
+                    raise ValueError("Webhook message sender is missing")
+                messages.append(message)
+    return messages
+
+
 @app.post("/webhook")
 async def receive_whatsapp_message(request: Request):
     raw_body = await request.body()
     verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256"))
+
+    if WHATSAPP_DURABLE_QUEUE_ENABLED:
+        try:
+            messages = _extract_webhook_messages(json.loads(raw_body))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise HTTPException(status_code=400, detail="Invalid webhook payload") from error
+        if messages:
+            try:
+                result = await _execute_db_query(
+                    supabase_admin.rpc("enqueue_whatsapp_messages", {"p_messages": messages})
+                )
+                if type(result.data) is not int or not 0 <= result.data <= len(messages):
+                    raise RuntimeError("Invalid WhatsApp inbox response")
+            except Exception as error:
+                print("WhatsApp inbox enqueue failed:", type(error).__name__)
+                raise HTTPException(status_code=503, detail="Webhook storage unavailable") from error
+        return {"status": "EVENT_RECEIVED"}
 
     try:
         body = json.loads(raw_body)
@@ -1817,6 +1863,7 @@ async def receive_whatsapp_message(request: Request):
                             save_whatsapp_order,
                             sender_phone,
                             session,
+                            message.get("id"),
                         )
                     except Exception as error:
                         print("❌ Failed to save WhatsApp order:", repr(error))
@@ -2673,6 +2720,9 @@ async def update_product(
         retail_price_str = form.get("retail_price")
         wholesale_price_str = form.get("wholesale_price")
         weight_kg_form_value = form.get("weight_kg")
+        has_weight_range = (
+            "weight_kg_min" in form or "weight_kg_max" in form
+        )
         product_status = form.get("status", "draft")
         description = form.get("description")
         colors_json = form.get("colors_json", "[]")
@@ -2698,7 +2748,10 @@ async def update_product(
         # 2. جلب بيانات المنتج الحالية للتأكد من الملكية ومعرفة هل تغير رقم الموديل؟
         current_prod_res = await _execute_db_query(
             supabase_admin.table("products")
-            .select("model_number, owner_id, manual_stock_deduction, weight_kg")
+            .select(
+                "model_number, owner_id, manual_stock_deduction, weight_kg, "
+                "weight_kg_min, weight_kg_max"
+            )
             .eq("id", product_id)
             .eq("owner_id", user_id)
         )
@@ -2707,10 +2760,26 @@ async def update_product(
             raise HTTPException(status_code=404, detail="المنتج غير موجود أو ليس لديك صلاحية لتعديله")
 
         old_model_number = current_prod_res.data[0]["model_number"]
+        current_product = current_prod_res.data[0]
+        if has_weight_range:
+            weight_kg_min, weight_kg_max = _parse_optional_weight_range(
+                form.get("weight_kg_min"),
+                form.get("weight_kg_max"),
+            )
+        elif weight_kg_form_value is not None:
+            weight_kg = _parse_optional_weight(weight_kg_form_value)
+            weight_kg_min = weight_kg
+            weight_kg_max = weight_kg
+        else:
+            weight_kg_min = current_product.get("weight_kg_min")
+            weight_kg_max = current_product.get("weight_kg_max")
+            if weight_kg_min is None and weight_kg_max is None:
+                weight_kg_min = current_product.get("weight_kg")
+                weight_kg_max = current_product.get("weight_kg")
         weight_kg = (
-            current_prod_res.data[0].get("weight_kg")
-            if weight_kg_form_value is None
-            else _parse_optional_weight(weight_kg_form_value)
+            weight_kg_min
+            if weight_kg_min == weight_kg_max
+            else None
         )
         manual_stock_deduction = _parse_boolean_form_value(
             form.get("manual_stock_deduction"),
@@ -2770,6 +2839,8 @@ async def update_product(
             "retail_price": retail_price,
             "wholesale_price": wholesale_price,
             "weight_kg": weight_kg,
+            "weight_kg_min": weight_kg_min,
+            "weight_kg_max": weight_kg_max,
             "status": product_status,
             "manual_stock_deduction": manual_stock_deduction,
             "updated_at": datetime.now(timezone.utc).isoformat()
