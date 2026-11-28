@@ -2619,6 +2619,46 @@ async def get_whatsapp_settings(user_id: str = Depends(get_current_user_id)):
 
 # =============================نموذج التقارير =============================
 
+@app.get("/api/storage/usage")
+async def get_project_storage_usage(user_id: str = Depends(get_current_user_id)):
+    try:
+        result = await _execute_db_query(
+            supabase_admin.rpc("project_storage_usage")
+        )
+        data = result.data
+        if not isinstance(data, dict):
+            raise ValueError("Invalid project storage response")
+        for field in ("database_bytes", "storage_bytes"):
+            if type(data.get(field)) is not int or data[field] < 0:
+                raise ValueError(f"Invalid {field}")
+
+        quotas = {}
+        for field, env_name in (
+            ("database_quota_bytes", "SUPABASE_DATABASE_QUOTA_BYTES"),
+            ("storage_quota_bytes", "SUPABASE_STORAGE_QUOTA_BYTES"),
+        ):
+            raw_value = os.getenv(env_name, "").strip()
+            if not raw_value:
+                quotas[field] = None
+            elif re.fullmatch(r"[0-9]+", raw_value) and int(raw_value) > 0:
+                quotas[field] = int(raw_value)
+            else:
+                raise ValueError(f"Invalid {env_name}")
+        return {
+            "status": "success",
+            "data": {
+                "database_bytes": data["database_bytes"],
+                "storage_bytes": data["storage_bytes"],
+                **quotas,
+            },
+        }
+    except Exception as error:
+        print("Project storage measurement failed:", type(error).__name__)
+        raise HTTPException(
+            status_code=503, detail="تعذر قياس مساحة التخزين أو قراءة إعدادات الحصة"
+        ) from error
+
+
 @app.get("/api/products/storage")
 async def get_product_storage(user_id: str = Depends(get_current_user_id)):
     try:
