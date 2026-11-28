@@ -2619,6 +2619,25 @@ async def get_whatsapp_settings(user_id: str = Depends(get_current_user_id)):
 
 # =============================نموذج التقارير =============================
 
+@app.get("/api/products/storage")
+async def get_product_storage(user_id: str = Depends(get_current_user_id)):
+    try:
+        result = await _execute_db_query(
+            supabase_admin.rpc("product_storage_metrics")
+        )
+        data = result.data
+        if not isinstance(data, dict):
+            raise ValueError("Invalid product storage response")
+        for field in ("product_tables_bytes", "product_images_bytes"):
+            if type(data.get(field)) is not int or data[field] < 0:
+                raise ValueError(f"Invalid {field}")
+        return {"status": "success", "data": data}
+    except Exception as error:
+        print("Product storage measurement failed:", type(error).__name__)
+        raise HTTPException(
+            status_code=503, detail="تعذر قياس مساحة المنتجات والصور"
+        ) from error
+
 @app.get("/api/database/storage")
 async def get_database_storage(
     user_id: str = Depends(get_current_user_id),
