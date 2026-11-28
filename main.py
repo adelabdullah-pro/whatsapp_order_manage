@@ -114,6 +114,11 @@ class RefreshSessionSchema(BaseModel):
     refresh_token: str
 
 
+class PasswordChangeSchema(BaseModel):
+    current_password: str
+    new_password: str
+
+
 # ==================== مسارات المصادقة ====================
 
 @app.post("/api/login")
@@ -267,6 +272,143 @@ async def auth_me(
         "authenticated": True,
         "user_id": user_id
     }
+
+
+def _account_auth_headers(authorization: Optional[str]) -> dict:
+    parts = (authorization or "").strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="يجب تسجيل الدخول أولاً")
+    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {parts[1]}"}
+
+
+async def _account_user(client: httpx.AsyncClient, headers: dict, user_id: str) -> dict:
+    result = await client.get(f"{SUPABASE_URL.rstrip('/')}/auth/v1/user", headers=headers)
+    if result.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail="انتهت الجلسة، سجل الدخول مجدداً")
+    if result.status_code != 200:
+        raise HTTPException(status_code=503, detail="تعذر تحميل بيانات الحساب")
+    try:
+        data = result.json()
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="استجابة بيانات الحساب غير صالحة") from error
+    if not isinstance(data, dict) or data.get("id") != user_id:
+        raise HTTPException(status_code=502, detail="استجابة بيانات الحساب غير صالحة")
+    return data
+
+
+@app.get("/api/auth/profile")
+async def account_profile(
+    response: Response,
+    authorization: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user_id),
+):
+    response.headers["Cache-Control"] = "no-store"
+    headers = _account_auth_headers(authorization)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            user = await _account_user(client, headers, user_id)
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=503, detail="تعذر الاتصال لجلب بيانات الحساب") from error
+    for field in ("email", "phone", "created_at"):
+        if user.get(field) is not None and not isinstance(user[field], str):
+            raise HTTPException(status_code=502, detail="استجابة بيانات الحساب غير صالحة")
+    return {"data": {
+        "id": user_id,
+        "email": user.get("email") or None,
+        "phone": user.get("phone") or None,
+        "created_at": user.get("created_at") or None,
+    }}
+
+
+@app.post("/api/auth/password")
+async def change_account_password(
+    request: Request,
+    response: Response,
+    authorization: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user_id),
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        credentials = PasswordChangeSchema.model_validate(await request.json())
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="بيانات تغيير كلمة المرور غير صالحة") from error
+    if not credentials.current_password or len(credentials.new_password) < 6:
+        raise HTTPException(status_code=400, detail="أدخل كلمة المرور الحالية والجديدة من 6 أحرف على الأقل")
+    if credentials.current_password == credentials.new_password:
+        raise HTTPException(status_code=400, detail="يجب أن تختلف كلمة المرور الجديدة عن الحالية")
+    headers = _account_auth_headers(authorization)
+    auth_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            user = await _account_user(client, headers, user_id)
+            email = user.get("email")
+            if not isinstance(email, str) or not email:
+                raise HTTPException(status_code=400, detail="لا يوجد بريد إلكتروني للتحقق من كلمة المرور")
+            verification = await client.post(
+                f"{auth_url}/token",
+                params={"grant_type": "password"},
+                headers={"apikey": SUPABASE_KEY},
+                json={"email": email, "password": credentials.current_password},
+            )
+            if verification.status_code in (400, 401):
+                raise HTTPException(status_code=400, detail="تعذر التحقق من كلمة المرور الحالية")
+            if verification.status_code == 429:
+                raise HTTPException(status_code=429, detail="محاولات كثيرة، حاول لاحقاً")
+            if verification.status_code != 200:
+                raise HTTPException(status_code=503, detail="تعذر التحقق من كلمة المرور، حاول لاحقاً")
+            try:
+                verified = verification.json()
+            except ValueError as error:
+                raise HTTPException(status_code=502, detail="استجابة التحقق غير صالحة") from error
+            token = verified.get("access_token") if isinstance(verified, dict) else None
+            if not isinstance(token, str) or not token:
+                raise HTTPException(status_code=502, detail="استجابة التحقق غير صالحة")
+            verified_user = verified.get("user")
+            cleanup = await client.post(
+                f"{auth_url}/logout",
+                params={"scope": "local"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {token}"},
+            )
+            if cleanup.status_code not in (200, 204):
+                print("Temporary password verification session cleanup failed:", cleanup.status_code)
+                raise HTTPException(status_code=503, detail="تعذر إنهاء جلسة التحقق، لم تتغير كلمة المرور")
+            if not isinstance(verified_user, dict) or verified_user.get("id") != user_id:
+                raise HTTPException(status_code=502, detail="استجابة التحقق غير صالحة")
+            result = await client.put(
+                f"{auth_url}/user",
+                headers=headers,
+                json={
+                    "password": credentials.new_password,
+                    "current_password": credentials.current_password,
+                },
+            )
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="تعذر الاتصال؛ إذا انقطع أثناء الحفظ فقد تكون كلمة المرور تغيرت. تحقق قبل المحاولة مجدداً",
+        ) from error
+    if result.status_code != 200:
+        try:
+            error_data = result.json()
+        except ValueError:
+            error_data = {}
+        code = error_data.get("code") if isinstance(error_data, dict) else None
+        messages = {
+            "current_password_mismatch": "كلمة المرور الحالية غير صحيحة",
+            "same_password": "يجب أن تختلف كلمة المرور الجديدة عن الحالية",
+            "weak_password": "كلمة المرور الجديدة لا تستوفي متطلبات الأمان في Supabase",
+            "reauthentication_needed": "يلزم تسجيل الدخول مجدداً قبل تغيير كلمة المرور",
+            "insufficient_aal": "يلزم إكمال التحقق الإضافي للحساب قبل تغيير كلمة المرور",
+        }
+        if code in messages:
+            raise HTTPException(status_code=400, detail=messages[code])
+        if result.status_code == 429:
+            raise HTTPException(status_code=429, detail="محاولات كثيرة، حاول لاحقاً")
+        if result.status_code in (401, 403):
+            raise HTTPException(status_code=401, detail="انتهت الجلسة أو تعذر التحقق منها، سجل الدخول مجدداً")
+        print("Password update failed:", result.status_code)
+        raise HTTPException(status_code=503, detail="تعذر تغيير كلمة المرور، تحقق من إعدادات الحساب وحاول مجدداً")
+    return {"message": "تم تغيير كلمة المرور بنجاح"}
 
 
 class MerchantIdentitySchema(BaseModel):
